@@ -1,0 +1,53 @@
+# ==========================================
+# 1. Entornos virtuales y archivos de Python
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+env/
+.env
+
+# ==========================================
+# 2. Directorios de Datos MASIVOS
+# Estos archivos pueden pesar Gigabytes. 
+# ==========================================
+data/raw/*
+!data/raw/.gitkeep
+
+data/pilot/*
+!data/pilot/.gitkeep
+
+data/processed/*
+!data/processed/.gitkeep
+
+data/dead_letters/*
+!data/dead_letters/.gitkeep
+
+*.pcap
+*.csv
+
+# ==========================================
+# 3. Modelos, Checkpoints y Resultados
+# ==========================================
+checkpoints/*
+!checkpoints/.gitkeep
+
+results/*
+!results/.gitkeep
+
+*.pt
+*.pth
+*.h5
+*.hdf5
+*.tar
+
+# ==========================================
+# 4. Telemetría y Entornos de IDEs
+# ==========================================
+mlruns/
+wandb/
+*.log
+.vscode/
+.idea/
+.ipynb_checkpoints/
