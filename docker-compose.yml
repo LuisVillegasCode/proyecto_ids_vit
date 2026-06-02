@@ -1,0 +1,34 @@
+version: '3.8'
+
+services:
+  vit_experiment:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: vit_pipeline
+    
+    # Permite a PyTorch usar toda la memoria compartida del host 
+    # para evitar el error "Bus error (core dumped)" al usar muchos workers
+    ipc: host 
+    
+    # Volúmenes persistentes estandarizados
+    # Garantiza que los modelos y la telemetría sobrevivan a caídas del contenedor
+    volumes:
+      - .:/app
+      - ./data:/app/data
+      - ./checkpoints:/app/checkpoints
+      - ./results:/app/results
+    
+    # Puente directo con el hardware de NVIDIA
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, utility, compute]
+              
+    # Mantiene el contenedor encendido esperando tus comandos vía SSH
+    tty: true
+    stdin_open: true
+    command: /bin/bash
