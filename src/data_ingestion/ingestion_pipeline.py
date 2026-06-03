@@ -83,84 +83,120 @@ def classify_and_route(src_ip, dst_ip, timestamp, six_tuple, oracle):
 def process_pcap_chunk(pcap_file, oracle):
     filename = os.path.basename(pcap_file)
     worker_id = os.getpid()
-    print(f"[*] Worker [{worker_id}] procesando: {filename}")
     
-    flows = defaultdict(list)
-    corrupt_packets = 0 # DLQ Tracker (FR10)
+    # ==========================================================
+    # MEJORA 1: IDEMPOTENCIA (No empezar desde cero)
+    # ==========================================================
+    train_exists = any(filename in f for f in os.listdir(OUTPUT_DIR_TRAIN))
+    test_exists = any(filename in f for f in os.listdir(OUTPUT_DIR_TEST))
     
-    with open(pcap_file, 'rb') as f:
-        pcap = dpkt.pcap.Reader(f)
-        
-        for timestamp, buf in pcap:
-            try:
-                eth = dpkt.ethernet.Ethernet(buf)
-                
-                # FR5: Enmascaramiento MAC
-                eth.src = b'\x00\x00\x00\x00\x00\x00'
-                eth.dst = b'\x00\x00\x00\x00\x00\x00'
+    if train_exists or test_exists:
+        print(f"[*] Worker [{worker_id}] omitiendo: {filename} (Ya procesado).")
+        return
 
-                # FR5: Soporte IPv4 / IPv6
-                if isinstance(eth.data, dpkt.ip.IP):
-                    ip = eth.data
-                    src_ip_str = socket.inet_ntoa(ip.src)
-                    dst_ip_str = socket.inet_ntoa(ip.dst)
-                    ip.src = b'\x00\x00\x00\x00'
-                    ip.dst = b'\x00\x00\x00\x00'
-                elif isinstance(eth.data, dpkt.ip6.IP6):
-                    ip = eth.data
-                    src_ip_str = socket.inet_ntop(socket.AF_INET6, ip.src)
-                    dst_ip_str = socket.inet_ntop(socket.AF_INET6, ip.dst)
-                    ip.src = b'\x00' * 16
-                    ip.dst = b'\x00' * 16
-                else:
-                    continue # Ignorar ARP, STP, etc.
-                
-                if isinstance(ip.data, dpkt.tcp.TCP) or isinstance(ip.data, dpkt.udp.UDP):
-                    transport = ip.data
-                    # Llave base. Nota: En un entorno real asimétrico, Forward y Backward
-                    # requieren direccionalidad, pero esto unifica el flujo bidireccional.
-                    six_tuple = f"{src_ip_str}-{dst_ip_str}-{transport.sport}-{transport.dport}-{ip.p}"
+    print(f"[*] Worker [{worker_id}] procesando: {filename}")
+    flows = defaultdict(list)
+    error_summary = defaultdict(int)
+     
+    
+    try:
+        with open(pcap_file, 'rb') as f:
+            # ==========================================================
+            # MEJORA 2: Blindaje de la Cabecera Global (Magic Number)
+            # ==========================================================
+            try:
+                pcap = dpkt.pcap.Reader(f)
+            except ValueError as e:
+                with open(os.path.join(GLOBAL_CONFIG['paths']['data']['dead_letters'], f"global_corruption.log"), "a") as err_log:
+                    err_log.write(f"{datetime.now()} - {filename} Corrupción total de cabecera. Ignorando archivo.\n")
+                return
+
+            # ==========================================================
+            # BLINDAJE CONTRA ARCHIVOS TRUNCADOS
+            # ==========================================================
+            while True:
+                try:
+                    timestamp, buf = next(pcap)
+                except StopIteration:
+                    break  # Fin natural del archivo
+                except Exception as e:
+                    with open(os.path.join(GLOBAL_CONFIG['paths']['data']['dead_letters'], f"truncations_worker_{worker_id}.log"), "a") as err_log:
+                        err_log.write(f"{datetime.now()} - {filename} truncado al final. Salvando flujos previos.\n")
+                    break
                     
-                    if len(flows[six_tuple]) >= MAX_PACKETS:
-                        continue
+                # ==========================================================
+                # LÓGICA DE NEGOCIO (FR5, FR4, Entropía)
+                # ==========================================================
+                try:
+                    eth = dpkt.ethernet.Ethernet(buf)
+                    
+                    # FR5: Enmascaramiento MAC
+                    eth.src = b'\x00\x00\x00\x00\x00\x00'
+                    eth.dst = b'\x00\x00\x00\x00\x00\x00'
+
+                    # FR5: Soporte IPv4 / IPv6
+                    if isinstance(eth.data, dpkt.ip.IP):
+                        ip = eth.data
+                        src_ip_str = socket.inet_ntoa(ip.src)
+                        dst_ip_str = socket.inet_ntoa(ip.dst)
+                        ip.src = b'\x00\x00\x00\x00'
+                        ip.dst = b'\x00\x00\x00\x00'
+                    elif isinstance(eth.data, dpkt.ip6.IP6):
+                        ip = eth.data
+                        src_ip_str = socket.inet_ntop(socket.AF_INET6, ip.src)
+                        dst_ip_str = socket.inet_ntop(socket.AF_INET6, ip.dst)
+                        ip.src = b'\x00' * 16
+                        ip.dst = b'\x00' * 16
+                    else:
+                        continue 
+                    
+                    if isinstance(ip.data, dpkt.tcp.TCP) or isinstance(ip.data, dpkt.udp.UDP):
+                        transport = ip.data
+                        six_tuple = f"{src_ip_str}-{dst_ip_str}-{transport.sport}-{transport.dport}-{ip.p}"
                         
-                    payload = transport.data
-                    entropy = 0.0
-                    if len(payload) > 0:
-                        # FR4: Cálculo de Entropía (Canal Azul)
-                        byte_counts = np.bincount(np.frombuffer(payload, dtype=np.uint8), minlength=256)
-                        probabilities = byte_counts[byte_counts > 0] / len(payload)
-                        entropy = -np.sum(probabilities * np.log2(probabilities))
-                    
-                    if len(flows[six_tuple]) == 0:
-                        # Primera vez que vemos el flujo, decidimos su destino
-                        target_dir, label = classify_and_route(src_ip_str, dst_ip_str, timestamp, six_tuple, oracle)
-                        flows[six_tuple].append({"metadata": (target_dir, label)})
-                    
-                    # FR4: Guardamos tanto la Entropía (Azul) como el Payload original enmascarado (Rojo/Verde)
-                    flows[six_tuple].append({
-                        "entropy": entropy, 
-                        "raw_bytes": np.frombuffer(bytes(eth), dtype=np.uint8) # Guardamos el paquete completo
-                    })
-                    
-            except Exception as e:
-                corrupt_packets += 1
-                continue
+                        if len(flows[six_tuple]) >= MAX_PACKETS:
+                            continue
+                            
+                        payload = transport.data
+                        entropy = 0.0
+                        if len(payload) > 0:
+                            # FR4: Cálculo de Entropía (Canal Azul)
+                            byte_counts = np.bincount(np.frombuffer(payload, dtype=np.uint8), minlength=256)
+                            probabilities = byte_counts[byte_counts > 0] / len(payload)
+                            entropy = -np.sum(probabilities * np.log2(probabilities))
+                        
+                        if len(flows[six_tuple]) == 0:
+                            target_dir, label = classify_and_route(src_ip_str, dst_ip_str, timestamp, six_tuple, oracle)
+                            flows[six_tuple].append({"metadata": (target_dir, label)})
+                        
+                        flows[six_tuple].append({
+                            "entropy": entropy, 
+                            "raw_bytes": np.frombuffer(bytes(eth), dtype=np.uint8)
+                        })
+                        
+                except Exception as e:
+                    error_summary[str(e)] += 1
+                    continue
+
+    except Exception as e:
+        print(f"Error crítico no controlado en {filename}: {str(e)}")
 
     # Registro de Dead-Letter Queue (FR10)
-    if corrupt_packets > 0:
+    if error_summary:
         with open(os.path.join(GLOBAL_CONFIG['paths']['data']['dead_letters'], f"dlq_worker_{worker_id}.log"), "a") as dlq:
-            dlq.write(f"{datetime.now()} - {filename} - {corrupt_packets} paquetes corruptos descartados.\n")
-    
-    # Creamos diccionarios para agrupar flujos por su destino real
+                    dlq.write(f"{datetime.now()} - {filename} - Reporte de Corrupción:\n")
+                    for error_msg, count in error_summary.items():
+                        dlq.write(f"  -> {count} paquetes descartados. Razón: {error_msg}\n")
+
+    # ==========================================================
+    # PERSISTENCIA ATÓMICA DOBLE (NFR7)
+    # ==========================================================
     train_flows = {k: v for k, v in flows.items() if len(v) > 1 and v[0]["metadata"][0] == OUTPUT_DIR_TRAIN}
     test_flows = {k: v for k, v in flows.items() if len(v) > 1 and v[0]["metadata"][0] == OUTPUT_DIR_TEST}
     
-    # Función auxiliar para escribir HDF5
     def write_hdf5(prefix, filename, flow_subset, target_dir):
         if not flow_subset: return
         
-        # 1. Crear el temporal DIRECTAMENTE en la carpeta destino (Volumen persistente)
         tmp_name = f"{prefix}_worker_{worker_id}_{filename}.hdf5.tmp"
         tmp_path = os.path.join(target_dir, tmp_name)
         
@@ -178,16 +214,13 @@ def process_pcap_chunk(pcap_file, oracle):
                 for idx, p in enumerate(packet_data[1:]):
                     raw_ds[idx] = p["raw_bytes"]
 
-        # 2. Rename Atómico seguro (mismo sistema de archivos)
         final_file = tmp_name.replace(".tmp", "")
         os.rename(tmp_path, os.path.join(target_dir, final_file))
 
-    # Ejecutar guardado seguro y aislado
     write_hdf5("train", filename, train_flows, OUTPUT_DIR_TRAIN)
     write_hdf5("test", filename, test_flows, OUTPUT_DIR_TEST)
     
     print(f"[✓] Worker [{worker_id}] finalizó: {len(train_flows)} a Train, {len(test_flows)} a Test.")
-
 # ==============================================================================
 # ORQUESTADOR (Soporta CLI Flags para unificar entornos)
 # ==============================================================================
