@@ -151,18 +151,19 @@ def process_pcap_chunk(pcap_file, oracle):
     if corrupt_packets > 0:
         with open(os.path.join(GLOBAL_CONFIG['paths']['data']['dead_letters'], f"dlq_worker_{worker_id}.log"), "a") as dlq:
             dlq.write(f"{datetime.now()} - {filename} - {corrupt_packets} paquetes corruptos descartados.\n")
-
-    # 4. PERSISTENCIA ATÓMICA DOBLE (Resolviendo la Contaminación Cruzada)
-    tmp_train = f"train_worker_{worker_id}_{filename}.hdf5.tmp"
-    tmp_test = f"test_worker_{worker_id}_{filename}.hdf5.tmp"
     
     # Creamos diccionarios para agrupar flujos por su destino real
     train_flows = {k: v for k, v in flows.items() if len(v) > 1 and v[0]["metadata"][0] == OUTPUT_DIR_TRAIN}
     test_flows = {k: v for k, v in flows.items() if len(v) > 1 and v[0]["metadata"][0] == OUTPUT_DIR_TEST}
     
     # Función auxiliar para escribir HDF5
-    def write_hdf5(tmp_path, flow_subset, target_dir):
+    def write_hdf5(prefix, filename, flow_subset, target_dir):
         if not flow_subset: return
+        
+        # 1. Crear el temporal DIRECTAMENTE en la carpeta destino (Volumen persistente)
+        tmp_name = f"{prefix}_worker_{worker_id}_{filename}.hdf5.tmp"
+        tmp_path = os.path.join(target_dir, tmp_name)
+        
         with h5py.File(tmp_path, 'w') as hf:
             for flow_id, packet_data in flow_subset.items():
                 meta = packet_data[0]["metadata"]
@@ -172,19 +173,18 @@ def process_pcap_chunk(pcap_file, oracle):
                 entropies = [p["entropy"] for p in packet_data[1:]]
                 grp.create_dataset('blue_channel_entropy', data=np.array(entropies, dtype=np.float32))
                 
-                # FR4: Guardar los bytes raw como objetos de longitud variable (vlen)
                 dt = h5py.vlen_dtype(np.dtype('uint8'))
                 raw_ds = grp.create_dataset('raw_packets', (len(packet_data)-1,), dtype=dt)
                 for idx, p in enumerate(packet_data[1:]):
                     raw_ds[idx] = p["raw_bytes"]
 
-        # Rename Atómico a su directorio final
-        final_file = tmp_path.replace(".tmp", "")
+        # 2. Rename Atómico seguro (mismo sistema de archivos)
+        final_file = tmp_name.replace(".tmp", "")
         os.rename(tmp_path, os.path.join(target_dir, final_file))
 
     # Ejecutar guardado seguro y aislado
-    write_hdf5(tmp_train, train_flows, OUTPUT_DIR_TRAIN)
-    write_hdf5(tmp_test, test_flows, OUTPUT_DIR_TEST)
+    write_hdf5("train", filename, train_flows, OUTPUT_DIR_TRAIN)
+    write_hdf5("test", filename, test_flows, OUTPUT_DIR_TEST)
     
     print(f"[✓] Worker [{worker_id}] finalizó: {len(train_flows)} a Train, {len(test_flows)} a Test.")
 
