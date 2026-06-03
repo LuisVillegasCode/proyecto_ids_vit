@@ -1,0 +1,64 @@
+# ==============================================================================
+# CONFIGURACIÓN GLOBAL - MOTOR OSR-ViT
+# ==============================================================================
+
+project:
+  name: "osr_vit_engine"
+  seed: 42                              # NFR1: Reproducibilidad Determinista Global
+
+# ------------------------------------------------------------------------------
+# 1. ENRUTAMIENTO DE INFRAESTRUCTURA (PATHS)
+# ------------------------------------------------------------------------------
+paths:
+  configs:
+    dataset_schedule: "configs/dataset_schedule.yaml"
+    scaler_bounds: "configs/scaler_bounds.json" # FR4.1: Límites Min-Max globales
+    
+  data:
+    pilot: "data/pilot/"                  # Sandbox para pruebas locales rápidas
+    raw_chunks: "data/raw/chunks/"        # PCAPs físicos fragmentados por editcap
+    dead_letters: "data/dead_letters/"    # FR10: Cola de cuarentena para paquetes corruptos
+    
+  output:
+    train_val: "data/processed/train_val/"
+    hold_out_test: "data/processed/hold_out_test/"
+    
+  artifacts:
+    checkpoints: "checkpoints/"           # FR11: Pesos del modelo y estado del optimizador (RNG)
+    results: "results/"                   # Matrices de confusión y gráficos Attention Rollout (XAI)
+    telemetry_logs: "mlruns/"             # NFR6: Registros inmutables en volumen montado (SSD)
+
+# ------------------------------------------------------------------------------
+# 2. PARÁMETROS DE PREPROCESAMIENTO Y TENSORIZACIÓN (Fase 1 y 2)
+# ------------------------------------------------------------------------------
+preprocessing:
+  max_packets_per_flow: 18                # FR4: Truncamiento físico duro (Espacio de ablación)
+  hashing_split_ratio: 0.9                # FR2.2: 90% Train/Val, 10% Test in-distribution
+  multiprocessing_workers: 8              # NFR2: Evasión del GIL (Ajustar a los núcleos lógicos del Xeon)
+
+# ------------------------------------------------------------------------------
+# 3. HIPERPARÁMETROS DEL VISION TRANSFORMER (Fase 3)
+# ------------------------------------------------------------------------------
+vit_model:
+  patch_size: 16
+  embed_dim: 768
+  depth: 12
+  num_heads: 12
+  
+training:
+  batch_size: 128                         # NFR5: Maximizado para aprovechar los 24GB VRAM de la NVIDIA L4
+  learning_rate: 0.0001
+  epochs: 50
+  mixed_precision: true                   # NFR5: Precisión Mixta Automática (AMP) habilitada
+  checkpoint_frequency: 5                 # FR11: Serializar estado completo cada N epochs
+
+# ------------------------------------------------------------------------------
+# 4. MOTOR DE RECONOCIMIENTO ABIERTO Y TELEMETRÍA (Fase 4 y 5)
+# ------------------------------------------------------------------------------
+osr_shield:
+  pca_variance_retained: 0.95             # FR8: Retención para el cálculo desde el token [CLS]
+  ridge_epsilon_init: 1.0e-5              # NFR8: Prevención de LinAlgError en matriz de covarianza
+  mad_multiplier_lambda: 1.0              # FR9: Multiplicador dinámico para la frontera de rechazo
+
+telemetry:
+  offline_mode: false                     # NFR6: Si es 'true', guarda localmente ante cortes de red GCP

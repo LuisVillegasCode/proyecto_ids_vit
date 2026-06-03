@@ -43,8 +43,10 @@ for pcap_file in "${pcap_files[@]}"; do
     
     if [ $? -eq 0 ]; then
         echo "[✓] Fragmentación exitosa para: $filename"
+        echo "[!] Purgando archivo original para liberar SSD NVMe..."
+        rm -f "$pcap_file"
     else
-        echo "[X] Error crítico al fragmentar: $filename"
+        echo "[X] Error crítico al fragmentar: $filename. Abortando purga."
         exit 1
     fi
 done
