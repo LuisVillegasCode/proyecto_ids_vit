@@ -7,7 +7,7 @@ set -euo pipefail
 # ========================================================
 
 sudo apt-get update
-sudo apt-get install -y awscli p7zip-full tshark
+sudo apt-get install -y p7zip-full
 
 # ========================================================
 # Preparación de directorios
@@ -115,12 +115,16 @@ for dia in "${!archivos[@]}"; do
     done
 
     # ----------------------------------------------------
-    # F. Ingesta
+    # F. Ingesta a Tensores Bidireccionales (Vía Docker)
     # ----------------------------------------------------
-
-    echo "[*] Ejecutando pipeline..."
-
-    python src/data_ingestion/ingestion_pipeline.py --mode prod
+    echo "[*] Ejecutando pipeline Python dentro del contenedor Docker..."
+    
+    docker run --rm \
+        --ipc=host \
+        -v "$(pwd):/app" \
+        -w /app \
+        vit-osr-env \
+        python src/data_ingestion/ingestion_pipeline.py --mode prod
 
     # ----------------------------------------------------
     # G. Limpieza final de PCAPs del día
