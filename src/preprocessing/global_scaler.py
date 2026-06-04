@@ -49,6 +49,7 @@ def process_single_file(file_path):
         return os.path.basename(file_path), local_min_ent, local_max_ent, local_min_raw, local_max_raw
     except Exception as e:
         # Si el archivo está corrupto, lo salta en silencio para no frenar el pool
+        print(f"\n[!] Fallo silencioso en {os.path.basename(file_path)}: {repr(e)}")
         return os.path.basename(file_path), None, None, None, None
 
 def calculate_global_bounds():
