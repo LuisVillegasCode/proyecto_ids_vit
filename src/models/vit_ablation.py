@@ -12,6 +12,8 @@ from torch.utils.data import Dataset, DataLoader
 from sklearn.metrics import matthews_corrcoef
 from einops.layers.torch import Rearrange
 from tqdm import tqdm
+import torch
+import torch.nn.functional as F
 
 # ==============================================================================
 # CONFIGURACIÓN Y TELEMETRÍA
@@ -218,7 +220,39 @@ class ViT_OSR(nn.Module):
         
         # Se retorna Logits (Softmax Implícito), el Token CLS y la Atención XAI
         return logits, cls_output, all_attn_weights 
+    
+class FocalLoss(nn.Module):
+    """
+    Penaliza a los ejemplos 'fáciles' (Benignos) y concentra los gradientes 
+    en los ejemplos 'difíciles' (Ataques) usando el factor gamma.
+    """
+    def __init__(self, weight=None, gamma=2.0, reduction='mean'):
+        super(FocalLoss, self).__init__()
+        self.weight = weight
+        self.gamma = gamma
+        # Validación temprana del parámetro de reducción
+        assert reduction in ['mean', 'sum', 'none'], "Reduction debe ser 'mean', 'sum' o 'none'"
+        self.reduction = reduction
 
+    def forward(self, inputs, targets):
+        # 1. CE puro (SIN pesos) para calcular la probabilidad exacta (pt)
+        ce_loss_unweighted = F.cross_entropy(inputs, targets, reduction='none')
+        pt = torch.exp(-ce_loss_unweighted)
+        
+        # 2. CE original (CON pesos) para mantener el balanceo base de clases
+        ce_loss_weighted = F.cross_entropy(inputs, targets, weight=self.weight, reduction='none')
+        
+        # 3. Fórmula final Focal Loss: Modulador * Loss Pesado
+        focal_loss = ((1 - pt) ** self.gamma) * ce_loss_weighted
+        
+        # 4. Manejo correcto de la reducción
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else: # reduction == 'none'
+            return focal_loss
+    
 # ==============================================================================
 # 3. ORQUESTADOR: ESTUDIO DE ABLACIÓN Y ENTRENAMIENTO (FR7, NFR5, FR11)
 # ==============================================================================
@@ -272,7 +306,7 @@ def train_ablation_study(mode):
         logging.info(f"[*] ViT Arquitectura: {vit_conf['embed_dim']}d, {vit_conf['depth']} layers, {vit_conf['num_heads']} heads")
         logging.info(f"[*] Parámetros Entrenables: {total_params:,}")
         
-        criterion = nn.CrossEntropyLoss(weight=class_weights)
+        criterion = FocalLoss(weight=class_weights, gamma=2.0)
         optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.01)
         scaler = torch.cuda.amp.GradScaler()
         
