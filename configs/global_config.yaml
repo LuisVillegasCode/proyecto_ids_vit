@@ -48,9 +48,9 @@ vit_model:
 training:
   batch_size: 128                         # NFR5: Maximizado para aprovechar los 24GB VRAM de la NVIDIA L4
   learning_rate: 0.0001
-  epochs: 50
+  epochs: 10
   mixed_precision: true                   # NFR5: Precisión Mixta Automática (AMP) habilitada
-  checkpoint_frequency: 5                 # FR11: Serializar estado completo cada N epochs
+  checkpoint_frequency: 2                 # FR11: Serializar estado completo cada N epochs
 
 # ------------------------------------------------------------------------------
 # 4. MOTOR DE RECONOCIMIENTO ABIERTO Y TELEMETRÍA (Fase 4 y 5)

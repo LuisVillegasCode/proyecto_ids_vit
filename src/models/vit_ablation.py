@@ -227,7 +227,7 @@ def train_ablation_study(mode):
     logging.info(f"[*] Acelerador detectado: {device}")
     
     # Estudio de ablación según Metodología 4.2
-    n_min_candidates = [3, 6, 9, 12, 15, 18]
+    n_min_candidates = [9]
     
     train_conf = GLOBAL_CONFIG['training']
     vit_conf = GLOBAL_CONFIG['vit_model']
@@ -298,7 +298,7 @@ def train_ablation_study(mode):
             all_preds, all_labels = [], []
             
             pbar = tqdm(dataloader, desc=f"Epoca {epoch+1}/{epochs_per_ablation}")
-            for inputs, labels in pbar:
+            for step, (inputs, labels) in enumerate(pbar):
                 if len(inputs) == 0: continue
                 inputs, labels = inputs.to(device), labels.to(device)
                 optimizer.zero_grad(set_to_none=True)
@@ -319,7 +319,11 @@ def train_ablation_study(mode):
                 
                 pbar.set_postfix(loss=loss.item())
                 
-            epoch_loss = running_loss / len(dataloader) if len(dataloader) > 0 else 0.0
+                if step >= 10000:
+                    break
+            
+            actual_steps = min(len(dataloader), 10001)    
+            epoch_loss = running_loss / actual_steps if actual_steps > 0 else 0.0
             mcc = matthews_corrcoef(all_labels, all_preds) if len(all_labels) > 0 else 0.0
             logging.info(f"[N_min={n_min}] Época {epoch+1} | Loss: {epoch_loss:.4f} | MCC Train: {mcc:.4f}")
             
