@@ -87,7 +87,7 @@ def evaluate_model(n_min, mode):
     mcc = matthews_corrcoef(all_labels, all_preds)
     logging.info(f"[*] Coeficiente de Correlación de Matthews (MCC): {mcc:.4f}")
 
-    # 5. CÁLCULO DE FALSE POSITIVE RATE (FPR) POR CLASE (Requisito estricto IDS)
+    # 5. CÁLCULO DE MÉTRICAS CRÍTICAS: FNR, RECALL Y FPR (Cumplimiento FR13)
     cm = confusion_matrix(all_labels, all_preds, labels=class_indices)
     
     FP = cm.sum(axis=0) - np.diag(cm) 
@@ -98,11 +98,17 @@ def evaluate_model(n_min, mode):
     # Sumamos 1e-6 al denominador para evitar divisiones por cero absolutas
     FPR = FP / (FP + TN + 1e-6)
     
+    # Denominador: Total de casos reales positivos para la clase
+    actual_positives = FN + TP + 1e-6 # 1e-6 evita división por cero
+    
+    FNR = FN / actual_positives
+    Recall = TP / actual_positives
+    
     logging.info("\n" + "="*60)
-    logging.info(" TASA DE FALSOS POSITIVOS (FPR) POR CLASE")
+    logging.info(" MÉTRICAS CRÍTICAS DE CIBERSEGURIDAD POR CLASE")
     logging.info("="*60)
     for idx, name in enumerate(class_names):
-        logging.info(f" -> {name}: {FPR[idx]:.4%} FPR")
+        logging.info(f" -> {name}: FNR = {FNR[idx]:.4%} | Recall = {Recall[idx]:.4%} | FPR = {FPR[idx]:.4%}")
 
     # 6. GENERACIÓN DE MATRIZ DE CONFUSIÓN VISUAL
     plt.figure(figsize=(10, 8))

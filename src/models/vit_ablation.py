@@ -9,7 +9,6 @@ import shutil
 import numpy as np
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
-from torch.cuda.amp import autocast, GradScaler
 from sklearn.metrics import matthews_corrcoef
 from einops.layers.torch import Rearrange
 from tqdm import tqdm
@@ -46,9 +45,10 @@ class IDS2018Dataset(Dataset):
         self.max_bytes = max_bytes
         self.mode = mode
         
-        # Caché local por worker para evitar el cuello de botella I/O
+        # Caché local por worker para evitar el cuello de botella I/O (NFR2)
         self.worker_file_cache = {}
         
+        # Carga de límites globales en RAM (FR4.1 - Anti-Fuga de Datos)
         with open(scaler_json, 'r') as f:
             bounds = json.load(f)
             self.min_e = bounds['entropy_channel']['min']
@@ -98,9 +98,7 @@ class IDS2018Dataset(Dataset):
         path = os.path.join(self.data_dir, fname)
         
         try:
-            # OPTIMIZACIÓN DE I/O: Mantener los archivos abiertos en la RAM del worker
             if path not in self.worker_file_cache:
-                # Límite de 20 archivos abiertos simultáneos por worker para evitar saturar el OS
                 if len(self.worker_file_cache) > 20:
                     oldest_path = list(self.worker_file_cache.keys())[0]
                     self.worker_file_cache[oldest_path].close()
@@ -111,19 +109,30 @@ class IDS2018Dataset(Dataset):
             grp = hf[flow_id]
             raw_pkts = grp['raw_packets'][:]
             entropies = grp['blue_channel_entropy'][:]
+            directions = grp['direction'][:] # 1: Forward, 0: Backward
             
             current_len = min(len(raw_pkts), self.n_min)
-            img = np.zeros((2, self.n_min, self.max_bytes), dtype=np.float32)
+            
+            # TENSOR 3D RGB-E (Metodología 3.2)
+            # Canal 0: Rojo (Forward), Canal 1: Verde (Backward), Canal 2: Azul (Entropía)
+            img = np.zeros((3, self.n_min, self.max_bytes), dtype=np.float32)
             
             for i in range(current_len):
                 pkt_bytes = raw_pkts[i][:self.max_bytes]
-                img[0, i, :len(pkt_bytes)] = pkt_bytes
-                img[1, i, :] = entropies[i]
+                if directions[i] == 1:
+                    img[0, i, :len(pkt_bytes)] = pkt_bytes  # Red Channel (Forward)
+                else:
+                    img[1, i, :len(pkt_bytes)] = pkt_bytes  # Green Channel (Backward)
                 
+                # Inyección de Entropía en Canal Azul
+                img[2, i, :] = entropies[i]
+                
+            # Estandarización Min-Max Global al vuelo
             if self.max_r > self.min_r:
                 img[0] = (img[0] - self.min_r) / (self.max_r - self.min_r)
+                img[1] = (img[1] - self.min_r) / (self.max_r - self.min_r)
             if self.max_e > self.min_e:
-                img[1] = (img[1] - self.min_e) / (self.max_e - self.min_e)
+                img[2] = (img[2] - self.min_e) / (self.max_e - self.min_e)
                 
             return torch.tensor(img, dtype=torch.float32), torch.tensor(label, dtype=torch.long)
             
@@ -132,14 +141,45 @@ class IDS2018Dataset(Dataset):
             return None
 
 # ==============================================================================
-# 2. ARQUITECTURA: VISION TRANSFORMER OSR (FR6)
+# 2. ARQUITECTURA: VISION TRANSFORMER OSR Y XAI (FR6, FR13)
 # ==============================================================================
+
+class TransparentTransformerBlock(nn.Module):
+    """
+    Reemplazo de la "caja negra" nn.TransformerEncoderLayer.
+    Exigido por FR13 para retornar explícitamente los mapas de atención (XAI).
+    """
+    def __init__(self, embed_dim, num_heads, mlp_ratio=4.0, dropout=0.1):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.attn = nn.MultiheadAttention(embed_dim, num_heads, dropout=dropout, batch_first=True)
+        
+        self.norm2 = nn.LayerNorm(embed_dim)
+        hidden_dim = int(embed_dim * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, embed_dim),
+            nn.Dropout(dropout)
+        )
+
+    def forward(self, x):
+        norm_x = self.norm1(x)
+        # need_weights=True permite la Inteligencia Artificial Explicable (XAI)
+        attn_out, attn_weights = self.attn(norm_x, norm_x, norm_x, need_weights=True)
+        x = x + attn_out
+        x = x + self.mlp(self.norm2(x))
+        return x, attn_weights
+
 class ViT_OSR(nn.Module):
     def __init__(self, n_min, max_bytes=128, patch_size=(1, 16), embed_dim=768, depth=12, num_heads=12, num_classes=7):
         super().__init__()
         self.patch_h, self.patch_w = patch_size
         num_patches = (n_min // self.patch_h) * (max_bytes // self.patch_w)
-        patch_dim = 2 * self.patch_h * self.patch_w
+        
+        # Actualizado a 3 canales (RGB-E)
+        patch_dim = 3 * self.patch_h * self.patch_w
         
         self.to_patch_embedding = nn.Sequential(
             Rearrange('b c (h p1) (w p2) -> b (h w) (p1 p2 c)', p1=self.patch_h, p2=self.patch_w),
@@ -151,8 +191,10 @@ class ViT_OSR(nn.Module):
         self.pos_embedding = nn.Parameter(torch.randn(1, num_patches + 1, embed_dim))
         self.cls_token = nn.Parameter(torch.randn(1, 1, embed_dim))
         
-        encoder_layer = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=num_heads, dim_feedforward=embed_dim*4, batch_first=True)
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=depth)
+        # Bloques transparentes (XAI)
+        self.layers = nn.ModuleList([
+            TransparentTransformerBlock(embed_dim, num_heads) for _ in range(depth)
+        ])
         
         self.mlp_head = nn.Sequential(
             nn.LayerNorm(embed_dim),
@@ -166,11 +208,16 @@ class ViT_OSR(nn.Module):
         x = torch.cat((cls_tokens, x), dim=1)
         x += self.pos_embedding[:, :(n + 1)]
         
-        x = self.transformer(x)
-        cls_output = x[:, 0]
+        all_attn_weights = []
+        for layer in self.layers:
+            x, attn_weights = layer(x)
+            all_attn_weights.append(attn_weights)
+            
+        cls_output = x[:, 0]  # Vector latente para Distancia de Mahalanobis (Fase 4)
         logits = self.mlp_head(cls_output)
         
-        return logits, cls_output, None 
+        # Se retorna Logits (Softmax Implícito), el Token CLS y la Atención XAI
+        return logits, cls_output, all_attn_weights 
 
 # ==============================================================================
 # 3. ORQUESTADOR: ESTUDIO DE ABLACIÓN Y ENTRENAMIENTO (FR7, NFR5, FR11)
@@ -179,9 +226,9 @@ def train_ablation_study(mode):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logging.info(f"[*] Acelerador detectado: {device}")
     
+    # Estudio de ablación según Metodología 4.2
     n_min_candidates = [3, 6, 9, 12, 15, 18]
     
-    # Carga estricta de hiperparámetros desde YAML
     train_conf = GLOBAL_CONFIG['training']
     vit_conf = GLOBAL_CONFIG['vit_model']
     
@@ -200,15 +247,19 @@ def train_ablation_study(mode):
         
         dataset = IDS2018Dataset(train_dir, scaler_json, n_min, mode=mode)
         total_samples = sum(dataset.class_counts.values())
-        class_weights = torch.tensor([total_samples / (len(dataset.class_counts) * (count + 1e-6)) for count in dataset.class_counts.values()], dtype=torch.float32).to(device)
+        
+        # FR7: Manejo de desbalanceo sin remuestreo sintético (Class Weights)
+        class_weights = torch.tensor([total_samples / (len(dataset.class_counts) * (count + 1e-6)) 
+                                      for count in dataset.class_counts.values()], dtype=torch.float32).to(device)
         
         cpu_count = os.cpu_count() or 2
         optimal_workers = 0 if mode == 'pilot' or cpu_count <= 2 else max(1, cpu_count - 1)
         optimal_prefetch = 2 if optimal_workers > 0 else None
         
-        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=optimal_workers, pin_memory=True, prefetch_factor=optimal_prefetch, collate_fn=safe_collate)
+        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, 
+                                num_workers=optimal_workers, pin_memory=True, 
+                                prefetch_factor=optimal_prefetch, collate_fn=safe_collate)
         
-        # Instanciación de ViT basada en YAML (Patch Size asimétrico)
         model = ViT_OSR(
             n_min=n_min,
             patch_size=(1, vit_conf['patch_size']), 
@@ -217,11 +268,9 @@ def train_ablation_study(mode):
             num_heads=vit_conf['num_heads']
         ).to(device)
         
-        # Telemetría de Arquitectura
         total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         logging.info(f"[*] ViT Arquitectura: {vit_conf['embed_dim']}d, {vit_conf['depth']} layers, {vit_conf['num_heads']} heads")
         logging.info(f"[*] Parámetros Entrenables: {total_params:,}")
-        logging.info(f"[*] Hyperparámetros: Batch={batch_size} | LR={learning_rate} | AMP=True")
         
         criterion = nn.CrossEntropyLoss(weight=class_weights)
         optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.01)
@@ -229,11 +278,13 @@ def train_ablation_study(mode):
         
         start_epoch = 0
         ckpt_path = os.path.join(ckpt_dir, f"vit_nmin_{n_min}_checkpoint.pt")
+        
         if os.path.exists(ckpt_path):
             checkpoint = torch.load(ckpt_path, map_location=device)
             model.load_state_dict(checkpoint['model_state'])
             optimizer.load_state_dict(checkpoint['optimizer_state'])
             scaler.load_state_dict(checkpoint['scaler_state'])
+            torch.set_rng_state(checkpoint['rng_state'])  # Restaurar semilla atómica (FR11)
             start_epoch = checkpoint['epoch'] + 1
             logging.info(f"[*] Rescatando entrenamiento desde la Época {start_epoch}")
             
@@ -252,6 +303,7 @@ def train_ablation_study(mode):
                 inputs, labels = inputs.to(device), labels.to(device)
                 optimizer.zero_grad(set_to_none=True)
                 
+                # NFR5: Eficiencia de VRAM con Precisión Mixta Automática (AMP)
                 with torch.amp.autocast('cuda'):
                     logits, _, _ = model(inputs)
                     loss = criterion(logits, labels)
@@ -271,18 +323,18 @@ def train_ablation_study(mode):
             mcc = matthews_corrcoef(all_labels, all_preds) if len(all_labels) > 0 else 0.0
             logging.info(f"[N_min={n_min}] Época {epoch+1} | Loss: {epoch_loss:.4f} | MCC Train: {mcc:.4f}")
             
-            # Resiliencia de apagones (Guarda el estado cada época)
+            # FR11: Resiliencia de apagones (Escritura Atómica)
             tmp_ckpt = ckpt_path + ".tmp"
             torch.save({
                 'epoch': epoch,
                 'model_state': model.state_dict(),
                 'optimizer_state': optimizer.state_dict(),
                 'scaler_state': scaler.state_dict(),
+                'rng_state': torch.get_rng_state(), 
                 'mcc': mcc
             }, tmp_ckpt)
             os.rename(tmp_ckpt, ckpt_path)
             
-            # FR11: Snapshots históricos según el YAML
             if (epoch + 1) % ckpt_freq == 0:
                 hist_path = os.path.join(ckpt_dir, f"vit_nmin_{n_min}_epoch_{epoch+1}.pt")
                 shutil.copyfile(ckpt_path, hist_path)
