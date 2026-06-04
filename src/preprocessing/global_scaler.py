@@ -39,8 +39,10 @@ def process_single_file(file_path):
                 if 'raw_packets' in grp:
                     raw_ds = grp['raw_packets'][:]
                     if raw_ds.size > 0:
-                        local_min_raw = min(local_min_raw, float(np.nanmin(raw_ds)))
-                        local_max_raw = max(local_max_raw, float(np.nanmax(raw_ds)))
+                        for packet in raw_ds:
+                            if packet.size > 0:
+                                local_min_raw = min(local_min_raw, float(np.nanmin(packet)))
+                                local_max_raw = max(local_max_raw, float(np.nanmax(packet)))
                         has_data = True
                         
         if not has_data:
