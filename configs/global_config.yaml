@@ -34,7 +34,7 @@ paths:
 preprocessing:
   max_packets_per_flow: 18                # FR4: Truncamiento físico duro (Espacio de ablación)
   hashing_split_ratio: 0.9                # FR2.2: 90% Train/Val, 10% Test in-distribution
-  multiprocessing_workers: 8              # NFR2: Evasión del GIL (Ajustar a los núcleos lógicos del Xeon)
+  multiprocessing_workers: 16              # NFR2: Evasión del GIL (Ajustar a los núcleos lógicos del Xeon)
 
 # ------------------------------------------------------------------------------
 # 3. HIPERPARÁMETROS DEL VISION TRANSFORMER (Fase 3)

@@ -252,8 +252,8 @@ def train_ablation_study(mode):
         class_weights = torch.tensor([total_samples / (len(dataset.class_counts) * (count + 1e-6)) 
                                       for count in dataset.class_counts.values()], dtype=torch.float32).to(device)
         
-        cpu_count = os.cpu_count() or 2
-        optimal_workers = 0 if mode == 'pilot' or cpu_count <= 2 else max(1, cpu_count - 1)
+        config_workers = GLOBAL_CONFIG['preprocessing']['multiprocessing_workers']
+        optimal_workers = 0 if mode == 'pilot' else config_workers
         optimal_prefetch = 2 if optimal_workers > 0 else None
         
         dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, 
@@ -274,7 +274,7 @@ def train_ablation_study(mode):
         
         criterion = nn.CrossEntropyLoss(weight=class_weights)
         optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.01)
-        scaler = torch.amp.GradScaler('cuda')
+        scaler = torch.cuda.amp.GradScaler()
         
         start_epoch = 0
         ckpt_path = os.path.join(ckpt_dir, f"vit_nmin_{n_min}_checkpoint.pt")
@@ -304,7 +304,7 @@ def train_ablation_study(mode):
                 optimizer.zero_grad(set_to_none=True)
                 
                 # NFR5: Eficiencia de VRAM con Precisión Mixta Automática (AMP)
-                with torch.amp.autocast('cuda'):
+                with torch.cuda.amp.autocast():
                     logits, _, _ = model(inputs)
                     loss = criterion(logits, labels)
                     
