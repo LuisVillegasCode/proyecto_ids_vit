@@ -4,6 +4,45 @@ import glob
 import h5py
 import numpy as np
 from tqdm import tqdm
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
+def audit_single_file(file_path):
+    """Evalúa un solo archivo HDF5. Lógica intacta de la versión secuencial."""
+    filename = os.path.basename(file_path)
+    is_train = "train" in file_path.lower() or "train" in filename.lower()
+    
+    num_flows = 0
+    max_packets = 0
+    corrupt_reason = None
+    has_nan_inf = False
+    
+    try:
+        with h5py.File(file_path, 'r') as f:
+            flow_keys = list(f.keys())
+            num_flows = len(flow_keys)
+            
+            if num_flows == 0:
+                return (file_path, is_train, 0, 0, "Archivo vacío (sin flujos)", False)
+
+            sample_flow = flow_keys[0]
+            
+            if "raw_packets" not in f[sample_flow] or "blue_channel_entropy" not in f[sample_flow]:
+                return (file_path, is_train, num_flows, 0, "Faltan canales RGB-E (raw_packets / blue_channel)", False)
+            
+            raw_data = f[sample_flow]["raw_packets"][:]
+            entropy_data = f[sample_flow]["blue_channel_entropy"][:]
+
+            max_packets = raw_data.shape[0]
+
+            if np.isnan(entropy_data).any() or np.isinf(entropy_data).any():
+                has_nan_inf = True
+
+    except OSError:
+        corrupt_reason = "Corrupción de lectura HDF5 (OSError)"
+    except Exception as e:
+        corrupt_reason = f"Error inesperado: {str(e)}"
+
+    return (file_path, is_train, num_flows, max_packets, corrupt_reason, has_nan_inf)
 
 def audit_hdf5_dataset(directory):
     print("=======================================================")
@@ -14,7 +53,10 @@ def audit_hdf5_dataset(directory):
         print(f"[X] Error crítico: No se encontraron archivos .hdf5 en {directory}")
         return
 
-    print(f"[*] Iniciando auditoría forense de {len(hdf5_files)} archivos HDF5...")
+    print(f"[*] Iniciando auditoría MULTIPROCESO de {len(hdf5_files)} archivos HDF5...")
+    # Usar todos los núcleos disponibles de la VM menos 1 (para no congelar el sistema)
+    max_cores = max(1, os.cpu_count() - 1)
+    print(f"[*] Motores paralelos asignados: {max_cores}")
     print("=======================================================")
 
     corrupt_files = []
@@ -23,47 +65,28 @@ def audit_hdf5_dataset(directory):
     total_test_flows = 0
     max_packets_found = 0
 
-    for file_path in tqdm(hdf5_files, desc="Auditando tensores"):
-        filename = os.path.basename(file_path)
-        is_train = "train" in file_path.lower() or "train" in filename.lower()
+    # Ejecución en paralelo
+    with ProcessPoolExecutor(max_workers=max_cores) as executor:
+        # Mapeamos la función a la lista de archivos
+        futures = {executor.submit(audit_single_file, path): path for path in hdf5_files}
         
-        try:
-            with h5py.File(file_path, 'r') as f:
-                flow_keys = list(f.keys())
+        for future in tqdm(as_completed(futures), total=len(hdf5_files), desc="Auditando tensores en paralelo"):
+            file_path, is_train, num_flows, max_packets, corrupt_reason, has_nan_inf = future.result()
+            
+            # Agregamos los resultados devueltos por cada hilo
+            if is_train:
+                total_train_flows += num_flows
+            else:
+                total_test_flows += num_flows
                 
-                if len(flow_keys) == 0:
-                    corrupt_files.append((file_path, "Archivo vacío (sin flujos)"))
-                    continue
-
-                if is_train:
-                    total_train_flows += len(flow_keys)
-                else:
-                    total_test_flows += len(flow_keys)
-
-                # Muestreo estricto: Revisamos la integridad del primer flujo de cada archivo 
-                # (Revisar absolutamente todos tomaría horas para 165GB)
-                sample_flow = flow_keys[0]
+            if max_packets > max_packets_found:
+                max_packets_found = max_packets
                 
-                if "raw_packets" not in f[sample_flow] or "blue_channel_entropy" not in f[sample_flow]:
-                    corrupt_files.append((file_path, "Faltan canales RGB-E (raw_packets / blue_channel)"))
-                    continue
+            if corrupt_reason:
+                corrupt_files.append((file_path, corrupt_reason))
                 
-                raw_data = f[sample_flow]["raw_packets"][:]
-                entropy_data = f[sample_flow]["blue_channel_entropy"][:]
-
-                # Registrar el flujo más largo encontrado (debería ser <= a tu límite MAX_PACKETS)
-                current_length = raw_data.shape[0]
-                if current_length > max_packets_found:
-                    max_packets_found = current_length
-
-                # Control de sanidad (NaN / Inf) en el canal de entropía (que es de tipo float)
-                if np.isnan(entropy_data).any() or np.isinf(entropy_data).any():
-                    nan_inf_files.append(file_path)
-
-        except OSError:
-            corrupt_files.append((file_path, "Corrupción de lectura HDF5 (OSError)"))
-        except Exception as e:
-            corrupt_files.append((file_path, f"Error inesperado: {str(e)}"))
+            if has_nan_inf:
+                nan_inf_files.append(file_path)
 
     # =======================================================
     # REPORTE FINAL DE AUDITORÍA
@@ -82,7 +105,6 @@ def audit_hdf5_dataset(directory):
         print(f"\n[🚨] AMENAZAS DETECTADAS:")
         if corrupt_files:
             print(f"  -> Archivos corruptos/incompletos: {len(corrupt_files)}")
-            # Mostrar solo los primeros 5 para no saturar la consola
             for path, reason in corrupt_files[:5]:
                 print(f"     - {os.path.basename(path)} ({reason})")
             if len(corrupt_files) > 5:
