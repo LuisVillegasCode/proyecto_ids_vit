@@ -18,13 +18,12 @@ def audit_single_file(file_path):
     
     try:
         with h5py.File(file_path, 'r') as f:
-            flow_keys = list(f.keys())
-            num_flows = len(flow_keys)
+            num_flows = len(f)
             
             if num_flows == 0:
                 return (file_path, is_train, 0, 0, "Archivo vacío (sin flujos)", False)
 
-            sample_flow = flow_keys[0]
+            sample_flow = next(iter(f))
             
             if "raw_packets" not in f[sample_flow] or "blue_channel_entropy" not in f[sample_flow]:
                 return (file_path, is_train, num_flows, 0, "Faltan canales RGB-E (raw_packets / blue_channel)", False)
