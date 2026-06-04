@@ -7,6 +7,7 @@ set -euo pipefail
 # ========================================================
 apt-get update
 apt-get install -y p7zip-full
+pip install --no-cache-dir PyYAML tqdm
 
 # ========================================================
 # Preparación de directorios
