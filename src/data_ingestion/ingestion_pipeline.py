@@ -7,12 +7,45 @@ import hashlib
 import argparse
 import multiprocessing as mp
 from datetime import datetime
-from collections import defaultdict
+from collections import defaultdict, Counter
 import numpy as np
 import h5py
 
+def inject_pilot_prefix(path_str: str) -> str:
+    # Protección contra strings vacíos o nulos
+    if not path_str:
+        return path_str
+        
+    # Protección contra el directorio raíz
+    if path_str in ('/', '\\'):
+        return path_str
+        
+    clean_path = path_str.rstrip('/\\')
+    head, tail = os.path.split(clean_path)
+    
+    # Idempotencia: Si ya es un entorno pilot, no hacemos nada
+    if tail.startswith('pilot_'):
+        return path_str
+        
+    new_path = os.path.join(head, f"pilot_{tail}")
+    
+    # Mantenemos el separador original exacto para evitar mezclar "/" y "\"
+    if path_str.endswith(('/', '\\')):
+        new_path += path_str[-1]
+        
+    return new_path
+
 # ==============================================================================
-# 0. VALIDACIÓN DURA DE ENTORNO Y YAML (Respuesta al Supervisor)
+# 0. CAPTURA DE ARGUMENTOS
+# ==============================================================================
+# Se ejecuta globalmente para que las variables muten antes de que nazcan los workers
+parser = argparse.ArgumentParser(description="Motor de Ingesta OSR-ViT")
+parser.add_argument('--mode', type=str, choices=['pilot', 'prod'], required=True)
+args, _ = parser.parse_known_args() # Usamos parse_known_args por seguridad a nivel global
+
+
+# ==============================================================================
+# 1. VALIDACIÓN DURA DE ENTORNO Y YAML 
 # ==============================================================================
 try:
     with open("configs/global_config.yaml", 'r') as f:
@@ -22,16 +55,26 @@ try:
     OUTPUT_DIR_TRAIN = GLOBAL_CONFIG['paths']['output']['train_val']
     OUTPUT_DIR_TEST = GLOBAL_CONFIG['paths']['output']['hold_out_test']
     MAX_PACKETS = GLOBAL_CONFIG['preprocessing']['max_packets_per_flow']
-    MAX_BYTES = 128 # TRUNCAMIENTO TEMPRANO PARA SALVAR RAM (Metodología ViT)
+    MAX_BYTES = 128 
+    TELEMETRY_LOGS = GLOBAL_CONFIG['paths']['artifacts'].get('telemetry_logs', 'artifacts/logs')
     
 except Exception as e:
     print(f"[!] FATAL ERROR: Estructura de global_config.yaml inválida o archivo faltante.\nDetalle: {e}")
     sys.exit(1)
 
+# ------------------------------------------------------------------------------
+# INYECCIÓN DEL BLOQUE DE AISLAMIENTO MLOps
+# ------------------------------------------------------------------------------
+if getattr(args, 'mode', None) == 'pilot':
+    OUTPUT_DIR_TRAIN = inject_pilot_prefix(OUTPUT_DIR_TRAIN)
+    OUTPUT_DIR_TEST  = inject_pilot_prefix(OUTPUT_DIR_TEST)
+    TELEMETRY_LOGS   = inject_pilot_prefix(TELEMETRY_LOGS)
+    
 # Crear directorios si no existen
 os.makedirs(OUTPUT_DIR_TRAIN, exist_ok=True)
 os.makedirs(OUTPUT_DIR_TEST, exist_ok=True)
 os.makedirs(GLOBAL_CONFIG['paths']['data']['dead_letters'], exist_ok=True)
+os.makedirs(TELEMETRY_LOGS, exist_ok=True)
 
 # ==============================================================================
 # 1. EL ORÁCULO
@@ -48,17 +91,19 @@ def load_oracle(yaml_path):
     for category in ['zero_day', 'closed_set']:
         if category not in config.get('attacks', {}): continue
         for attack in config['attacks'][category]:
-            date_str = attack['date']
+            date_str = str(attack['date']).strip()
             for window in attack['time_windows']:
-                start_dt = datetime.strptime(f"{date_str} {window[0]}", "%Y-%m-%d %H:%M")
-                end_dt = datetime.strptime(f"{date_str} {window[1]}", "%Y-%m-%d %H:%M")
+                from datetime import timezone
+                start_dt = datetime.strptime(f"{date_str} {window[0].strip()}", "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+                end_dt = datetime.strptime(f"{date_str} {window[1].strip()}", "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+                
                 compiled_rules.append({
                     'start_epoch': start_dt.timestamp(),
                     'end_epoch': end_dt.timestamp(),
-                    'attacker_ips': set(attack['attacker_ips']), # Optimización de búsqueda
-                    'victim_ips': set(attack['victim_ips']),
-                    'target_folder': attack['target_folder'],
-                    'label': attack['label']
+                    'attacker_ips': set(str(ip).strip() for ip in attack['attacker_ips']), 
+                    'victim_ips': set(str(ip).strip() for ip in attack['victim_ips']),
+                    'target_folder': str(attack['target_folder']).strip(),
+                    'label': str(attack['label']).strip()
                 })
     return compiled_rules
 
@@ -77,11 +122,9 @@ def classify_and_route(src_ip, dst_ip, timestamp, tuple_key, oracle):
                 target_folder = rule['target_folder']
                 break
     
-    # FR3: Aislamiento determinista OOD
     if target_folder == "hold_out_test":
         return OUTPUT_DIR_TEST, attack_label
         
-    # FR2.2: Partición Estratificada por Hashing
     hash_object = hashlib.md5(tuple_key.encode('utf-8'))
     hash_integer = int(hash_object.hexdigest(), 16)
     
@@ -91,30 +134,25 @@ def classify_and_route(src_ip, dst_ip, timestamp, tuple_key, oracle):
         return OUTPUT_DIR_TEST, attack_label
 
 # ==============================================================================
-# 3. EL TRABAJADOR DE CPU (Blindado contra OOM e Idempotencia Insegura)
+# 3. EL TRABAJADOR DE CPU
 # ==============================================================================
 def process_pcap_chunk(pcap_file, oracle):
     filename = os.path.basename(pcap_file)
     worker_id = os.getpid()
     
-    # ==========================================================
-    # CORRECCIÓN DE IDEMPOTENCIA (Anti-Falsos Positivos)
-    # ==========================================================
     def is_already_processed(fname):
         for directory in [OUTPUT_DIR_TRAIN, OUTPUT_DIR_TEST]:
             for existing_file in os.listdir(directory):
-                # Validar sufijo exacto para evitar conflictos chunk1 vs chunk11
                 if existing_file.endswith(f"_{fname}.hdf5"):
                     return True
         return False
 
     if is_already_processed(filename):
         print(f"[*] Worker [{worker_id}] omitiendo: {filename} (Procesamiento previo detectado).")
-        return
+        return None
 
     print(f"[*] Worker [{worker_id}] procesando: {filename}")
     
-    # Manejo optimizado de RAM
     flows = defaultdict(list)
     error_summary = defaultdict(int)
      
@@ -125,7 +163,7 @@ def process_pcap_chunk(pcap_file, oracle):
             except ValueError as e:
                 with open(os.path.join(GLOBAL_CONFIG['paths']['data']['dead_letters'], f"global_corruption.log"), "a") as err_log:
                     err_log.write(f"{datetime.now()} - {filename} Corrupción de cabecera mágica. Ignorando.\n")
-                return
+                return None
 
             while True:
                 try:
@@ -137,11 +175,8 @@ def process_pcap_chunk(pcap_file, oracle):
                         err_log.write(f"{datetime.now()} - {filename} Fin abrupto (Truncado). Salvando flujos sanos previos.\n")
                     break
                     
-                # LÓGICA DE NEGOCIO (FR5, FR4, Direccionalidad Bi-yectiva)
                 try:
                     eth = dpkt.ethernet.Ethernet(buf)
-                    
-                    # FR5: Enmascaramiento Espacial
                     eth.src = b'\x00\x00\x00\x00\x00\x00'
                     eth.dst = b'\x00\x00\x00\x00\x00\x00'
 
@@ -163,13 +198,11 @@ def process_pcap_chunk(pcap_file, oracle):
                     if isinstance(ip.data, dpkt.tcp.TCP) or isinstance(ip.data, dpkt.udp.UDP):
                         transport = ip.data
                         
-                        # Tupla Canónica (Segura para HDF5 Keys)
                         if src_ip_str < dst_ip_str:
                             canonical_tuple = f"{src_ip_str}-{dst_ip_str}-{transport.sport}-{transport.dport}-{ip.p}"
                         else:
                             canonical_tuple = f"{dst_ip_str}-{src_ip_str}-{transport.dport}-{transport.sport}-{ip.p}"
                         
-                        # FR4: Limitación dura de campo receptivo (Evita sobrecarga RAM/HDF5)
                         packet_count = len(flows[canonical_tuple]) - 1
                         if packet_count >= MAX_PACKETS:
                             continue
@@ -192,7 +225,6 @@ def process_pcap_chunk(pcap_file, oracle):
                         is_forward = (src_ip_str == initiator_ip)
                         direction_flag = 1 if is_forward else 0 
 
-                        # OPTIMIZACIÓN DE MEMORIA CRÍTICA (bytes(eth)[:MAX_BYTES])
                         raw_bytes = np.frombuffer(bytes(eth)[:MAX_BYTES], dtype=np.uint8)
                         
                         flows[canonical_tuple].append({
@@ -208,30 +240,29 @@ def process_pcap_chunk(pcap_file, oracle):
     except Exception as e:
         print(f"Error crítico no controlado en {filename}: {str(e)}")
 
-    # FR10: Dead-Letter Queue sin detener el Pipeline
     if error_summary:
         with open(os.path.join(GLOBAL_CONFIG['paths']['data']['dead_letters'], f"dlq_worker_{worker_id}.log"), "a") as dlq:
                     dlq.write(f"{datetime.now()} - {filename} - Reporte de Corrupción:\n")
                     for error_msg, count in error_summary.items():
                         dlq.write(f"  -> {count} paquetes descartados. Razón: {error_msg}\n")
 
-    # ==========================================================
-    # PERSISTENCIA ATÓMICA Y SEGURIDAD DE CLAVES (NFR7)
-    # ==========================================================
     train_flows = {k: v for k, v in flows.items() if len(v) > 1 and v[0]["metadata"][0] == OUTPUT_DIR_TRAIN}
     test_flows = {k: v for k, v in flows.items() if len(v) > 1 and v[0]["metadata"][0] == OUTPUT_DIR_TEST}
     
+    # FR12: Recopilador Local de Estadísticas
+    local_worker_counts = defaultdict(int)
+    for v in train_flows.values():
+        local_worker_counts[v[0]["metadata"][1]] += 1
+    for v in test_flows.values():
+        local_worker_counts[v[0]["metadata"][1]] += 1
+
     def write_hdf5(prefix, fname, flow_subset, target_dir):
         if not flow_subset: return
-        
         tmp_name = f"{prefix}_worker_{worker_id}_{fname}.hdf5.tmp"
         tmp_path = os.path.join(target_dir, tmp_name)
-        
         with h5py.File(tmp_path, 'w') as hf:
             for flow_id, packet_data in flow_subset.items():
                 meta = packet_data[0]["metadata"]
-                
-                # Saneamiento de Clave HDF5 por seguridad
                 safe_flow_id = str(flow_id).replace('/', '_').replace('\\', '_')
                 grp = hf.create_group(safe_flow_id)
                 grp.attrs['label'] = str(meta[1])
@@ -248,28 +279,26 @@ def process_pcap_chunk(pcap_file, oracle):
                     raw_ds[idx] = p["raw_bytes"]
 
         final_file = tmp_name.replace(".tmp", "")
-        # NFR7: Renombrado Atómico (Garantiza que no queden HDF5 corruptos si el SO se apaga)
         os.rename(tmp_path, os.path.join(target_dir, final_file))
 
     write_hdf5("train", filename, train_flows, OUTPUT_DIR_TRAIN)
     write_hdf5("test", filename, test_flows, OUTPUT_DIR_TEST)
     
     print(f"[✓] Worker [{worker_id}] finalizó: {len(train_flows)} a Train, {len(test_flows)} a Test.")
+    
+    # Retornamos el diccionario de frecuencias local al orquestador
+    return dict(local_worker_counts)
 
 # ==============================================================================
 # ORQUESTADOR MLOps
 # ==============================================================================
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Motor de Ingesta OSR-ViT")
-    parser.add_argument('--mode', type=str, choices=['pilot', 'prod'], required=True)
-    args = parser.parse_args()
 
     if args.mode == 'pilot':
         input_dir = GLOBAL_CONFIG['paths']['data']['pilot']
     else:
         input_dir = GLOBAL_CONFIG['paths']['data']['raw_chunks']
         
-    # VALIDACIÓN DURA DE DIRECTORIO DE ENTRADA
     if not os.path.exists(input_dir) or not os.path.isdir(input_dir):
         print(f"[!] FATAL ERROR: El directorio de entrada '{input_dir}' no existe.")
         sys.exit(1)
@@ -285,12 +314,56 @@ if __name__ == "__main__":
         print(f"[*] ALERTA: No hay archivos PCAP detectados en {input_dir}. Finalizando con éxito pasivo.")
         sys.exit(0)
         
-    # Asignación de hilos (Resiliencia si YAML pide más núcleos de los reales)
     requested_workers = GLOBAL_CONFIG['preprocessing']['multiprocessing_workers']
     max_workers = min(requested_workers, mp.cpu_count(), len(pcap_files))
     
     print(f"[*] Inicializando Pool con {max_workers} Workers Concurrentes...")
     pool = mp.Pool(processes=max_workers)
-    pool.starmap(process_pcap_chunk, [(pcap, oracle_rules) for pcap in pcap_files])
+    
+    # starmap_async o starmap almacena lo que retorna cada worker en una lista
+    resultados = pool.starmap(process_pcap_chunk, [(pcap, oracle_rules) for pcap in pcap_files])
     pool.close()
     pool.join()
+
+    # ==========================================================
+    # FR12: REPORTING DE TRAZABILIDAD Y TELEMETRÍA 
+    # ==========================================================
+    print("\n[*] Consolidando reporte de trazabilidad...")
+    global_counts = defaultdict(int)
+    
+    # Agregar contadores de todos los workers
+    for res in resultados:
+        if res: # Ignorar workers que retornaron None (archivos ya procesados)
+            for label, count in res.items():
+                global_counts[label] += count
+                
+    total_flows = sum(global_counts.values())
+    
+    if total_flows > 0:
+        report_lines = []
+        report_lines.append("=====================================================================================")
+        report_lines.append("REPORTE DE TRAZABILIDAD: DISTRIBUCIÓN DE CLASES OBTENIDA DEL PCAP CRUDO")
+        report_lines.append("=====================================================================================")
+        report_lines.append(f"{'Label':<30} | {'Flujos Totales':<15} | {'Porcentaje (%)':<15}")
+        report_lines.append("-" * 85)
+        
+        # Ordenar de mayor a menor frecuencia
+        for label, count in sorted(global_counts.items(), key=lambda item: item[1], reverse=True):
+            pct = (count / total_flows) * 100
+            report_lines.append(f"{label:<30} | {count:<15} | {pct:>8.4f}%")
+            
+        report_lines.append("-" * 85)
+        report_lines.append(f"Total de flujos procesados: {total_flows:,}")
+        report_lines.append(f"Clases detectadas: {len(global_counts)}")
+        report_lines.append("=====================================================================================")
+        
+        report_text = "\n".join(report_lines)
+        print(report_text)
+        
+        # Guardar físicamente
+        report_path = os.path.join(TELEMETRY_LOGS, f"ingestion_distribution_{args.mode}.txt")
+        with open(report_path, "w", encoding="utf-8") as f:
+            f.write(report_text)
+        print(f"[*] Reporte de Trazabilidad guardado exitosamente en: {report_path}")
+    else:
+        print("[!] No se procesaron nuevos flujos en esta ejecución.")
