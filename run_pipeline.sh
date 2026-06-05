@@ -67,18 +67,16 @@ for dia in "${!archivos[@]}"; do
     done
 
     # F. Ingesta a Tensores Bidireccionales
-    # (Ya estamos en Docker, ejecutamos directamente)
-    echo "[*] Ejecutando pipeline Python..."
-    python src/data_ingestion/ingestion_pipeline.py --mode prod
+    echo "[!] Saltando la ingesta de Python para que la arregles al llegar..."
 
     # G. Limpieza final de PCAPs del día
-    echo "[*] Eliminando PCAPs procesados..."
-    find data/raw/chunks -maxdepth 1 -type f -name "${prefijo}_*.pcap" -delete
+    echo "[!] Saltando la limpieza de PCAPs para conservarlos..."
 
     echo "[✓] DÍA $dia COMPLETADO CON ÉXITO."
     echo
 done
 
 echo "========================================================"
-echo "[🚀] TODA LA INGESTA HA FINALIZADO."
+echo "[🚀] TODA LA DESCARGA Y EXTRACCIÓN HA FINALIZADO."
+echo "[!] Los PCAPs están listos en data/raw/chunks/ esperándote."
 echo "========================================================"
