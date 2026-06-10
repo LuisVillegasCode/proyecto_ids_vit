@@ -54,13 +54,9 @@ BATCH_FLUSH_SIZE = 10000
 
 # PILAR 4: Tasas de retención para In-Flight Undersampling
 RETENTION_RATES = {
-    'Benign': 0.05,
-    'DoS Hulk': 0.05,
-    'DDoS': 0.05,
-    'DoS Slowhttptest': 0.10,
-    'DoS Slowloris': 0.10,
-    'DoS GoldenEye': 0.10,
-    'PortScan': 0.10
+    'Benign': 0.05,  
+    'DoS': 0.10,     
+    'DDoS': 0.10    
 }
 
 if getattr(args, 'mode', None) == 'pilot':
