@@ -5,48 +5,29 @@ import dpkt
 import socket
 import hashlib
 import argparse
+import random
 import multiprocessing as mp
-from datetime import datetime
-from collections import defaultdict, Counter
+from datetime import datetime, timezone, timedelta
+from collections import defaultdict
 import numpy as np
 import h5py
 
 def inject_pilot_prefix(path_str: str) -> str:
-    # Protección contra strings vacíos o nulos
-    if not path_str:
-        return path_str
-        
-    # Protección contra el directorio raíz
-    if path_str in ('/', '\\'):
-        return path_str
-        
+    if not path_str or path_str in ('/', '\\'): return path_str
     clean_path = path_str.rstrip('/\\')
     head, tail = os.path.split(clean_path)
-    
-    # Idempotencia: Si ya es un entorno pilot, no hacemos nada
-    if tail.startswith('pilot_'):
-        return path_str
-        
+    if tail.startswith('pilot_'): return path_str
     new_path = os.path.join(head, f"pilot_{tail}")
-    
-    # Mantenemos el separador original exacto para evitar mezclar "/" y "\"
-    if path_str.endswith(('/', '\\')):
-        new_path += path_str[-1]
-        
+    if path_str.endswith(('/', '\\')): new_path += path_str[-1]
     return new_path
 
 # ==============================================================================
-# 0. CAPTURA DE ARGUMENTOS
+# 0. CONFIGURACIÓN GLOBAL Y ARGUMENTOS
 # ==============================================================================
-# Se ejecuta globalmente para que las variables muten antes de que nazcan los workers
 parser = argparse.ArgumentParser(description="Motor de Ingesta OSR-ViT")
 parser.add_argument('--mode', type=str, choices=['pilot', 'prod'], required=True)
-args, _ = parser.parse_known_args() # Usamos parse_known_args por seguridad a nivel global
+args, _ = parser.parse_known_args() 
 
-
-# ==============================================================================
-# 1. VALIDACIÓN DURA DE ENTORNO Y YAML 
-# ==============================================================================
 try:
     with open("configs/global_config.yaml", 'r') as f:
         GLOBAL_CONFIG = yaml.safe_load(f)
@@ -54,316 +35,378 @@ try:
     YAML_PATH = GLOBAL_CONFIG['paths']['configs']['dataset_schedule']
     OUTPUT_DIR_TRAIN = GLOBAL_CONFIG['paths']['output']['train_val']
     OUTPUT_DIR_TEST = GLOBAL_CONFIG['paths']['output']['hold_out_test']
-    MAX_PACKETS = GLOBAL_CONFIG['preprocessing']['max_packets_per_flow']
+    MAX_PACKETS = GLOBAL_CONFIG['preprocessing'].get('max_packets_per_flow', 18)
     MAX_BYTES = 128 
     TELEMETRY_LOGS = GLOBAL_CONFIG['paths']['artifacts'].get('telemetry_logs', 'artifacts/logs')
     
 except Exception as e:
-    print(f"[!] FATAL ERROR: Estructura de global_config.yaml inválida o archivo faltante.\nDetalle: {e}")
+    print(f"[!] FATAL ERROR: Estructura de global_config.yaml inválida.\nDetalle: {e}")
     sys.exit(1)
 
-# ------------------------------------------------------------------------------
-# INYECCIÓN DEL BLOQUE DE AISLAMIENTO MLOps
-# ------------------------------------------------------------------------------
+# PILAR 1: Parámetros de Máquina de Estados TCP/UDP
+FLOW_TIMEOUT_SECONDS = 120.0
+SWEEP_INTERVAL = 100000
+TCP_FIN = 0x01
+TCP_RST = 0x04
+
+# Parámetro para prevenir OOM (Solución Problema 4)
+BATCH_FLUSH_SIZE = 10000
+
+# PILAR 4: Tasas de retención para In-Flight Undersampling
+RETENTION_RATES = {
+    'Benign': 0.05,
+    'DoS Hulk': 0.05,
+    'DDoS': 0.05,
+    'DoS Slowhttptest': 0.10,
+    'DoS Slowloris': 0.10,
+    'DoS GoldenEye': 0.10,
+    'PortScan': 0.10
+}
+
 if getattr(args, 'mode', None) == 'pilot':
     OUTPUT_DIR_TRAIN = inject_pilot_prefix(OUTPUT_DIR_TRAIN)
     OUTPUT_DIR_TEST  = inject_pilot_prefix(OUTPUT_DIR_TEST)
     TELEMETRY_LOGS   = inject_pilot_prefix(TELEMETRY_LOGS)
     
-# Crear directorios si no existen
 os.makedirs(OUTPUT_DIR_TRAIN, exist_ok=True)
 os.makedirs(OUTPUT_DIR_TEST, exist_ok=True)
 os.makedirs(GLOBAL_CONFIG['paths']['data']['dead_letters'], exist_ok=True)
 os.makedirs(TELEMETRY_LOGS, exist_ok=True)
 
 # ==============================================================================
-# 1. EL ORÁCULO
+# PILAR 3: ORÁCULO DINÁMICO
 # ==============================================================================
-def load_oracle(yaml_path):
+def load_time_aware_oracle(yaml_path):
     try:
         with open(yaml_path, 'r') as file:
             config = yaml.safe_load(file)
     except Exception as e:
-        print(f"[!] FATAL ERROR: No se pudo leer el oráculo {yaml_path}. \n{e}")
+        print(f"[!] FATAL ERROR: Oráculo {yaml_path} inaccesible. \n{e}")
         sys.exit(1)
         
-    compiled_rules = []
+    rules_dict = {}
+    ast_tz = timezone(timedelta(hours=-4))
+    
     for category in ['zero_day', 'closed_set']:
         if category not in config.get('attacks', {}): continue
         for attack in config['attacks'][category]:
             date_str = str(attack['date']).strip()
-            for window in attack['time_windows']:
-                from datetime import timezone
-                start_dt = datetime.strptime(f"{date_str} {window[0].strip()}", "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
-                end_dt = datetime.strptime(f"{date_str} {window[1].strip()}", "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+            windows_epoch = []
+            for w in attack['time_windows']:
+                start_dt = datetime.strptime(f"{date_str} {w[0].strip()}", "%Y-%m-%d %H:%M").replace(tzinfo=ast_tz)
+                end_dt = datetime.strptime(f"{date_str} {w[1].strip()}", "%Y-%m-%d %H:%M").replace(tzinfo=ast_tz)
+                windows_epoch.append((start_dt.timestamp(), end_dt.timestamp()))
                 
-                compiled_rules.append({
-                    'start_epoch': start_dt.timestamp(),
-                    'end_epoch': end_dt.timestamp(),
-                    'attacker_ips': set(str(ip).strip() for ip in attack['attacker_ips']), 
-                    'victim_ips': set(str(ip).strip() for ip in attack['victim_ips']),
-                    'target_folder': str(attack['target_folder']).strip(),
-                    'label': str(attack['label']).strip()
-                })
-    return compiled_rules
+            for a_ip in attack['attacker_ips']:
+                for v_ip in attack['victim_ips']:
+                    pair = (str(a_ip).strip(), str(v_ip).strip())
+                    if pair not in rules_dict:
+                        rules_dict[pair] = []
+                    rules_dict[pair].append({
+                        'label': str(attack['label']).strip(),
+                        'target_folder': str(attack['target_folder']).strip(),
+                        'windows': windows_epoch
+                    })
+    return rules_dict
 
-# ==============================================================================
-# 2. MOTOR DE REGLAS Y ENRUTAMIENTO 
-# ==============================================================================
-def classify_and_route(src_ip, dst_ip, timestamp, tuple_key, oracle):
-    attack_label = "Benign"
-    target_folder = "stratified_split"
-    
-    for rule in oracle:
-        if rule['start_epoch'] <= timestamp <= rule['end_epoch']:
-            if (src_ip in rule['attacker_ips'] and dst_ip in rule['victim_ips']) or \
-               (src_ip in rule['victim_ips'] and dst_ip in rule['attacker_ips']):
-                attack_label = rule['label']
-                target_folder = rule['target_folder']
-                break
-    
+def get_packet_label_fast(src_ip, dst_ip, ts, rules_dict):
+    for pair in [(src_ip, dst_ip), (dst_ip, src_ip)]:
+        if pair in rules_dict:
+            for attack in rules_dict[pair]:
+                for w in attack['windows']:
+                    if w[0] <= ts <= w[1]:
+                        return attack['label'], attack['target_folder']
+    return "Benign", "stratified_split"
+
+def get_routing_split(tuple_key, target_folder):
     if target_folder == "hold_out_test":
-        return OUTPUT_DIR_TEST, attack_label
-        
-    hash_object = hashlib.md5(tuple_key.encode('utf-8'))
-    hash_integer = int(hash_object.hexdigest(), 16)
-    
-    if (hash_integer % 10) < 9:
-        return OUTPUT_DIR_TRAIN, attack_label
-    else:
-        return OUTPUT_DIR_TEST, attack_label
+        return OUTPUT_DIR_TEST
+    hash_integer = int(hashlib.md5(tuple_key.encode('utf-8')).hexdigest(), 16)
+    return OUTPUT_DIR_TRAIN if (hash_integer % 10) < 9 else OUTPUT_DIR_TEST
 
 # ==============================================================================
-# 3. EL TRABAJADOR DE CPU
+# PILAR 5: ENSAMBLADOR DE TENSORES RGB-E
 # ==============================================================================
-def process_pcap_chunk(pcap_file, oracle):
+def build_and_route_tensor(flow_id, state, finalized_flows, local_metrics):
+    label = state['label']
+    
+    retention_prob = RETENTION_RATES.get(label, 1.0)
+    if random.random() > retention_prob:
+        local_metrics['discarded_undersampling'][label] += 1
+        return
+
+    tensor = np.zeros((MAX_PACKETS, MAX_BYTES, 3), dtype=np.float32)
+    
+    for i, pkt in enumerate(state['packets']):
+        if i >= MAX_PACKETS: break
+        
+        raw = pkt['raw_bytes']
+        # Solución Problema 5: Asignación segura
+        length = min(len(raw), MAX_BYTES)
+        
+        if pkt['is_forward']:
+            tensor[i, :length, 0] = raw[:length]
+        else:
+            tensor[i, :length, 1] = raw[:length]
+            
+        tensor[i, :, 2] = pkt['entropy'] 
+        
+    split_dir = state['target_dir']
+    finalized_flows[split_dir][flow_id] = {
+        'tensor': tensor,
+        'label': label
+    }
+    local_metrics['generated_tensors'][label] += 1
+
+# ==============================================================================
+# FLUSH HDF5 (Solución Problema 4)
+# ==============================================================================
+def flush_tensors_hdf5(prefix, target_dir, data_dict, worker_id, filename, batch_id):
+    if not data_dict: return
+    # Incorporamos el batch_id para evitar sobrescrituras de lotes del mismo archivo
+    tmp_path = os.path.join(target_dir, f"{prefix}_w{worker_id}_b{batch_id}_{filename}.hdf5.tmp")
+    with h5py.File(tmp_path, 'w') as hf:
+        for flow_id, payload in data_dict.items():
+            safe_id = str(flow_id).replace('/', '_').replace('\\', '_')
+            grp = hf.create_group(safe_id)
+            grp.attrs['label'] = payload['label']
+            grp.create_dataset('rgb_e_tensor', data=payload['tensor'], compression="lzf")
+            
+    os.rename(tmp_path, tmp_path.replace(".tmp", ""))
+    data_dict.clear() # Liberar RAM instantáneamente
+
+# ==============================================================================
+# TRABAJADOR PRINCIPAL
+# ==============================================================================
+def process_pcap_chunk(pcap_file, rules_dict):
     filename = os.path.basename(pcap_file)
     worker_id = os.getpid()
     
-    def is_already_processed(fname):
-        for directory in [OUTPUT_DIR_TRAIN, OUTPUT_DIR_TEST]:
-            for existing_file in os.listdir(directory):
-                if existing_file.endswith(f"_{fname}.hdf5"):
-                    return True
-        return False
-
-    if is_already_processed(filename):
-        print(f"[*] Worker [{worker_id}] omitiendo: {filename} (Procesamiento previo detectado).")
-        return None
-
     print(f"[*] Worker [{worker_id}] procesando: {filename}")
     
-    flows = defaultdict(list)
+    flow_states = {}
+    finalized_flows = {OUTPUT_DIR_TRAIN: {}, OUTPUT_DIR_TEST: {}}
+    local_metrics = {'generated_tensors': defaultdict(int), 'discarded_undersampling': defaultdict(int)}
+    
+    packet_count = 0
+    batch_counter = 0
     error_summary = defaultdict(int)
      
     try:
         with open(pcap_file, 'rb') as f:
-            try:
-                pcap = dpkt.pcap.Reader(f)
-            except ValueError as e:
-                with open(os.path.join(GLOBAL_CONFIG['paths']['data']['dead_letters'], f"global_corruption.log"), "a") as err_log:
-                    err_log.write(f"{datetime.now()} - {filename} Corrupción de cabecera mágica. Ignorando.\n")
-                return None
+            pcap = dpkt.pcap.Reader(f)
+            
+            for timestamp, buf in pcap:
+                packet_count += 1
+                
+                # Solución Problema 4: Flush proactivo por lotes (Control OOM)
+                if packet_count % 10000 == 0:
+                    total_in_ram = len(finalized_flows[OUTPUT_DIR_TRAIN]) + len(finalized_flows[OUTPUT_DIR_TEST])
+                    if total_in_ram >= BATCH_FLUSH_SIZE:
+                        batch_counter += 1
+                        flush_tensors_hdf5("train", OUTPUT_DIR_TRAIN, finalized_flows[OUTPUT_DIR_TRAIN], worker_id, filename, batch_counter)
+                        flush_tensors_hdf5("test", OUTPUT_DIR_TEST, finalized_flows[OUTPUT_DIR_TEST], worker_id, filename, batch_counter)
 
-            while True:
-                try:
-                    timestamp, buf = next(pcap)
-                except StopIteration:
-                    break 
-                except Exception as e:
-                    with open(os.path.join(GLOBAL_CONFIG['paths']['data']['dead_letters'], f"truncations_worker_{worker_id}.log"), "a") as err_log:
-                        err_log.write(f"{datetime.now()} - {filename} Fin abrupto (Truncado). Salvando flujos sanos previos.\n")
-                    break
-                    
+                # PILAR 1: Garbage Collector Global
+                if packet_count % SWEEP_INTERVAL == 0:
+                    expired_flows = [fid for fid, st in flow_states.items() if (timestamp - st['last_time']) > FLOW_TIMEOUT_SECONDS]
+                    for fid in expired_flows:
+                        if flow_states[fid]['status'] == 'CAPTURING' and len(flow_states[fid]['packets']) > 0:
+                            build_and_route_tensor(fid, flow_states[fid], finalized_flows, local_metrics)
+                        del flow_states[fid]
+
                 try:
                     eth = dpkt.ethernet.Ethernet(buf)
-                    eth.src = b'\x00\x00\x00\x00\x00\x00'
-                    eth.dst = b'\x00\x00\x00\x00\x00\x00'
-
-                    if isinstance(eth.data, dpkt.ip.IP):
-                        ip = eth.data
-                        src_ip_str = socket.inet_ntoa(ip.src)
-                        dst_ip_str = socket.inet_ntoa(ip.dst)
-                        ip.src = b'\x00\x00\x00\x00'
-                        ip.dst = b'\x00\x00\x00\x00'
-                    elif isinstance(eth.data, dpkt.ip6.IP6):
-                        ip = eth.data
-                        src_ip_str = socket.inet_ntop(socket.AF_INET6, ip.src)
-                        dst_ip_str = socket.inet_ntop(socket.AF_INET6, ip.dst)
-                        ip.src = b'\x00' * 16
-                        ip.dst = b'\x00' * 16
-                    else:
+                    if not isinstance(eth.data, dpkt.ip.IP) and not isinstance(eth.data, dpkt.ip6.IP6):
                         continue 
                     
-                    if isinstance(ip.data, dpkt.tcp.TCP) or isinstance(ip.data, dpkt.udp.UDP):
-                        transport = ip.data
+                    ip = eth.data
+                    if isinstance(ip, dpkt.ip.IP):
+                        src_ip_str = socket.inet_ntoa(ip.src)
+                        dst_ip_str = socket.inet_ntoa(ip.dst)
+                    else:
+                        src_ip_str = socket.inet_ntop(socket.AF_INET6, ip.src)
+                        dst_ip_str = socket.inet_ntop(socket.AF_INET6, ip.dst)
+                    
+                    # Ofuscación de IP
+                    eth.src = b'\x00'*6; eth.dst = b'\x00'*6
+                    if isinstance(ip, dpkt.ip.IP):
+                        ip.src = b'\x00'*4; ip.dst = b'\x00'*4
+                    else:
+                        ip.src = b'\x00'*16; ip.dst = b'\x00'*16
+                    
+                    proto = getattr(ip, "p", getattr(ip, "nxt", 0))
+                    if not (isinstance(ip.data, dpkt.tcp.TCP) or isinstance(ip.data, dpkt.udp.UDP)):
+                        continue
                         
-                        if src_ip_str < dst_ip_str:
-                            canonical_tuple = f"{src_ip_str}-{dst_ip_str}-{transport.sport}-{transport.dport}-{ip.p}"
-                        else:
-                            canonical_tuple = f"{dst_ip_str}-{src_ip_str}-{transport.dport}-{transport.sport}-{ip.p}"
-                        
-                        packet_count = len(flows[canonical_tuple]) - 1
-                        if packet_count >= MAX_PACKETS:
-                            continue
-                            
+                    transport = ip.data
+                    sport, dport = transport.sport, transport.dport
+                    is_teardown = False
+                    
+                    if isinstance(transport, dpkt.tcp.TCP):
+                        if (transport.flags & TCP_FIN) or (transport.flags & TCP_RST):
+                            is_teardown = True
+
+                    canonical_tuple = f"{src_ip_str}-{dst_ip_str}-{sport}-{dport}-{proto}" if (src_ip_str, sport) <= (dst_ip_str, dport) else f"{dst_ip_str}-{src_ip_str}-{dport}-{sport}-{proto}"
+                    packet_label, target_folder = get_packet_label_fast(src_ip_str, dst_ip_str, timestamp, rules_dict)
+
+                    # PILAR 1: Timeout Inmediato
+                    if canonical_tuple in flow_states:
+                        if (timestamp - flow_states[canonical_tuple]['last_time']) > FLOW_TIMEOUT_SECONDS:
+                            if flow_states[canonical_tuple]['status'] == 'CAPTURING' and len(flow_states[canonical_tuple]['packets']) > 0:
+                                build_and_route_tensor(canonical_tuple, flow_states[canonical_tuple], finalized_flows, local_metrics)
+                            del flow_states[canonical_tuple]
+
+                    # Inicialización
+                    if canonical_tuple not in flow_states:
+                        flow_states[canonical_tuple] = {
+                            'packets': [],
+                            'last_time': timestamp,
+                            'status': 'CAPTURING',
+                            'label': packet_label,
+                            'target_dir': get_routing_split(canonical_tuple, target_folder),
+                            'initiator_ip': src_ip_str
+                        }
+
+                    state = flow_states[canonical_tuple]
+                    state['last_time'] = timestamp
+
+                    # PILAR 3 / Solución Problema 1: Promoción Dinámica de Etiquetas segura
+                    if packet_label != 'Benign' and state['label'] != packet_label:
+                        state['label'] = packet_label
+                        # target_dir se mantiene intacto para garantizar reproducibilidad 
+
+                    # PILAR 2: Máquina de Estados y Detección Temprana (IGNORING)
+                    if state['status'] == 'CAPTURING':
                         payload = transport.data
                         entropy = 0.0
                         if len(payload) > 0:
                             byte_counts = np.bincount(np.frombuffer(payload, dtype=np.uint8), minlength=256)
-                            probabilities = byte_counts[byte_counts > 0] / len(payload)
-                            entropy = -np.sum(probabilities * np.log2(probabilities))
-                        
-                        if len(flows[canonical_tuple]) == 0:
-                            target_dir, label = classify_and_route(src_ip_str, dst_ip_str, timestamp, canonical_tuple, oracle)
-                            flows[canonical_tuple].append({
-                                "metadata": (target_dir, label),
-                                "initiator_ip": src_ip_str
-                            })
-                        
-                        initiator_ip = flows[canonical_tuple][0]["initiator_ip"]
-                        is_forward = (src_ip_str == initiator_ip)
-                        direction_flag = 1 if is_forward else 0 
+                            probs = byte_counts[byte_counts > 0] / len(payload)
+                            entropy = -np.sum(probs * np.log2(probs))
 
-                        raw_bytes = np.frombuffer(bytes(eth)[:MAX_BYTES], dtype=np.uint8)
-                        
-                        flows[canonical_tuple].append({
-                            "entropy": entropy, 
-                            "raw_bytes": raw_bytes,
-                            "direction": direction_flag 
+                        state['packets'].append({
+                            'entropy': float(entropy),
+                            'raw_bytes': np.frombuffer(bytes(eth)[:MAX_BYTES], dtype=np.uint8),
+                            'is_forward': (src_ip_str == state['initiator_ip'])
                         })
                         
+                        if len(state['packets']) == MAX_PACKETS:
+                            build_and_route_tensor(canonical_tuple, state, finalized_flows, local_metrics)
+                            state['status'] = 'IGNORING'
+                            
+                        elif is_teardown:
+                            build_and_route_tensor(canonical_tuple, state, finalized_flows, local_metrics)
+                            del flow_states[canonical_tuple]
+                            
+                    elif state['status'] == 'IGNORING':
+                        if is_teardown:
+                            del flow_states[canonical_tuple]
+
                 except Exception as e:
                     error_summary[str(e)] += 1
                     continue
 
     except Exception as e:
-        print(f"Error crítico no controlado en {filename}: {str(e)}")
+        print(f"[!] Error crítico en {filename}: {str(e)}")
 
-    if error_summary:
-        with open(os.path.join(GLOBAL_CONFIG['paths']['data']['dead_letters'], f"dlq_worker_{worker_id}.log"), "a") as dlq:
-                    dlq.write(f"{datetime.now()} - {filename} - Reporte de Corrupción:\n")
-                    for error_msg, count in error_summary.items():
-                        dlq.write(f"  -> {count} paquetes descartados. Razón: {error_msg}\n")
+    # Limpieza residual
+    for fid, st in flow_states.items():
+        if st['status'] == 'CAPTURING' and len(st['packets']) > 0:
+            build_and_route_tensor(fid, st, finalized_flows, local_metrics)
 
-    train_flows = {k: v for k, v in flows.items() if len(v) > 1 and v[0]["metadata"][0] == OUTPUT_DIR_TRAIN}
-    test_flows = {k: v for k, v in flows.items() if len(v) > 1 and v[0]["metadata"][0] == OUTPUT_DIR_TEST}
+    # Flush final de cualquier tensor restante
+    batch_counter += 1
+    flush_tensors_hdf5("train", OUTPUT_DIR_TRAIN, finalized_flows[OUTPUT_DIR_TRAIN], worker_id, filename, batch_counter)
+    flush_tensors_hdf5("test", OUTPUT_DIR_TEST, finalized_flows[OUTPUT_DIR_TEST], worker_id, filename, batch_counter)
     
-    # FR12: Recopilador Local de Estadísticas
-    local_worker_counts = defaultdict(int)
-    for v in train_flows.values():
-        local_worker_counts[v[0]["metadata"][1]] += 1
-    for v in test_flows.values():
-        local_worker_counts[v[0]["metadata"][1]] += 1
-
-    def write_hdf5(prefix, fname, flow_subset, target_dir):
-        if not flow_subset: return
-        tmp_name = f"{prefix}_worker_{worker_id}_{fname}.hdf5.tmp"
-        tmp_path = os.path.join(target_dir, tmp_name)
-        with h5py.File(tmp_path, 'w') as hf:
-            for flow_id, packet_data in flow_subset.items():
-                meta = packet_data[0]["metadata"]
-                safe_flow_id = str(flow_id).replace('/', '_').replace('\\', '_')
-                grp = hf.create_group(safe_flow_id)
-                grp.attrs['label'] = str(meta[1])
-                
-                entropies = [p["entropy"] for p in packet_data[1:]]
-                grp.create_dataset('blue_channel_entropy', data=np.array(entropies, dtype=np.float32))
-                
-                directions = [p["direction"] for p in packet_data[1:]]
-                grp.create_dataset('direction', data=np.array(directions, dtype=np.int8))
-                
-                dt = h5py.vlen_dtype(np.dtype('uint8'))
-                raw_ds = grp.create_dataset('raw_packets', (len(packet_data)-1,), dtype=dt)
-                for idx, p in enumerate(packet_data[1:]):
-                    raw_ds[idx] = p["raw_bytes"]
-
-        final_file = tmp_name.replace(".tmp", "")
-        os.rename(tmp_path, os.path.join(target_dir, final_file))
-
-    write_hdf5("train", filename, train_flows, OUTPUT_DIR_TRAIN)
-    write_hdf5("test", filename, test_flows, OUTPUT_DIR_TEST)
-    
-    print(f"[✓] Worker [{worker_id}] finalizó: {len(train_flows)} a Train, {len(test_flows)} a Test.")
-    
-    # Retornamos el diccionario de frecuencias local al orquestador
-    return dict(local_worker_counts)
+    print(f"[✓] Worker [{worker_id}] procesó {filename}. Generados: {sum(local_metrics['generated_tensors'].values())}")
+    return dict(local_metrics)
 
 # ==============================================================================
 # ORQUESTADOR MLOps
 # ==============================================================================
 if __name__ == "__main__":
 
-    if args.mode == 'pilot':
-        input_dir = GLOBAL_CONFIG['paths']['data']['pilot']
-    else:
-        input_dir = GLOBAL_CONFIG['paths']['data']['raw_chunks']
+    input_dir = GLOBAL_CONFIG['paths']['data']['pilot'] if args.mode == 'pilot' else GLOBAL_CONFIG['paths']['data']['raw_chunks']
         
     if not os.path.exists(input_dir) or not os.path.isdir(input_dir):
-        print(f"[!] FATAL ERROR: El directorio de entrada '{input_dir}' no existe.")
+        print(f"[!] FATAL ERROR: Directorio de entrada '{input_dir}' no existe.")
         sys.exit(1)
 
     print("=======================================================")
-    print(f" MOTOR DE INGESTA OSR-VIT INICIADO (MODO: {args.mode.upper()})")
+    print(f" MOTOR OSR-VIT: RGB-E TENSOR FACTORY (MODO: {args.mode.upper()})")
     print("=======================================================")
     
-    oracle_rules = load_oracle(YAML_PATH)
+    rules_dict = load_time_aware_oracle(YAML_PATH)
     pcap_files = [os.path.join(input_dir, f) for f in os.listdir(input_dir) if f.endswith('.pcap')]
     
     if not pcap_files:
-        print(f"[*] ALERTA: No hay archivos PCAP detectados en {input_dir}. Finalizando con éxito pasivo.")
+        print(f"[*] ALERTA: No hay archivos PCAP en {input_dir}.")
+        sys.exit(0)
+
+    # Solución Problemas 2 y 3: Idempotencia resuelta en Orquestador O(N)
+    print("[*] Evaluando integridad e idempotencia en disco...")
+    processed_files_set = set()
+    for directory in [OUTPUT_DIR_TRAIN, OUTPUT_DIR_TEST]:
+        if os.path.exists(directory):
+            processed_files_set.update(os.listdir(directory))
+            
+    pending_pcaps = []
+    for pcap in pcap_files:
+        fname = os.path.basename(pcap)
+        if not any(pf.endswith(f"_{fname}.hdf5") for pf in processed_files_set):
+            pending_pcaps.append(pcap)
+            
+    if not pending_pcaps:
+        print(f"[*] ALERTA: Todos los archivos PCAP detectados ya fueron procesados previamente. Finalizando ejecución pasivamente.")
         sys.exit(0)
         
-    requested_workers = GLOBAL_CONFIG['preprocessing']['multiprocessing_workers']
-    max_workers = min(requested_workers, mp.cpu_count(), len(pcap_files))
+    max_workers = min(GLOBAL_CONFIG['preprocessing']['multiprocessing_workers'], mp.cpu_count(), len(pending_pcaps))
+    print(f"[*] Desplegando Pool con {max_workers} Workers Concurrentes para procesar {len(pending_pcaps)} archivos pendientes...")
     
-    print(f"[*] Inicializando Pool con {max_workers} Workers Concurrentes...")
-    pool = mp.Pool(processes=max_workers)
-    
-    # starmap_async o starmap almacena lo que retorna cada worker en una lista
-    resultados = pool.starmap(process_pcap_chunk, [(pcap, oracle_rules) for pcap in pcap_files])
-    pool.close()
-    pool.join()
+    with mp.Pool(processes=max_workers) as pool:
+        resultados = pool.starmap(process_pcap_chunk, [(pcap, rules_dict) for pcap in pending_pcaps])
 
     # ==========================================================
-    # FR12: REPORTING DE TRAZABILIDAD Y TELEMETRÍA 
+    # REPORTE DE TELEMETRÍA MLOps
     # ==========================================================
-    print("\n[*] Consolidando reporte de trazabilidad...")
-    global_counts = defaultdict(int)
+    print("\n[*] Consolidando telemetría de tensores...")
+    gen_counts = defaultdict(int)
+    disc_counts = defaultdict(int)
     
-    # Agregar contadores de todos los workers
     for res in resultados:
-        if res: # Ignorar workers que retornaron None (archivos ya procesados)
-            for label, count in res.items():
-                global_counts[label] += count
+        if res:
+            for label, count in res['generated_tensors'].items(): gen_counts[label] += count
+            for label, count in res['discarded_undersampling'].items(): disc_counts[label] += count
                 
-    total_flows = sum(global_counts.values())
+    total_gen = sum(gen_counts.values())
+    total_disc = sum(disc_counts.values())
     
-    if total_flows > 0:
-        report_lines = []
-        report_lines.append("=====================================================================================")
-        report_lines.append("REPORTE DE TRAZABILIDAD: DISTRIBUCIÓN DE CLASES OBTENIDA DEL PCAP CRUDO")
-        report_lines.append("=====================================================================================")
-        report_lines.append(f"{'Label':<30} | {'Flujos Totales':<15} | {'Porcentaje (%)':<15}")
-        report_lines.append("-" * 85)
+    report_lines = [
+        "=====================================================================================",
+        " REPORTE FINAL: TENSORES RGB-E GENERADOS PARA ENTRENAMIENTO",
+        "=====================================================================================",
+        f"{'Label':<25} | {'Generados (Saved)':<18} | {'Descartados (Undersampling)':<25}",
+        "-" * 75
+    ]
+    
+    all_labels = set(gen_counts.keys()).union(set(disc_counts.keys()))
+    for label in sorted(all_labels):
+        report_lines.append(f"{label:<25} | {gen_counts[label]:<18,} | {disc_counts[label]:<25,}")
         
-        # Ordenar de mayor a menor frecuencia
-        for label, count in sorted(global_counts.items(), key=lambda item: item[1], reverse=True):
-            pct = (count / total_flows) * 100
-            report_lines.append(f"{label:<30} | {count:<15} | {pct:>8.4f}%")
-            
-        report_lines.append("-" * 85)
-        report_lines.append(f"Total de flujos procesados: {total_flows:,}")
-        report_lines.append(f"Clases detectadas: {len(global_counts)}")
-        report_lines.append("=====================================================================================")
-        
-        report_text = "\n".join(report_lines)
-        print(report_text)
-        
-        # Guardar físicamente
-        report_path = os.path.join(TELEMETRY_LOGS, f"ingestion_distribution_{args.mode}.txt")
-        with open(report_path, "w", encoding="utf-8") as f:
-            f.write(report_text)
-        print(f"[*] Reporte de Trazabilidad guardado exitosamente en: {report_path}")
-    else:
-        print("[!] No se procesaron nuevos flujos en esta ejecución.")
+    report_lines.extend([
+        "-" * 75,
+        f"Total Tensores Extraídos: {total_gen + total_disc:,}",
+        f"Total Redundancia Purgada: {total_disc:,}",
+        f"TOTAL TENSORES EN DISCO : {total_gen:,}",
+        "====================================================================================="
+    ])
+    
+    report_text = "\n".join(report_lines)
+    print(report_text)
+    
+    report_path = os.path.join(TELEMETRY_LOGS, f"tensor_distribution_{args.mode}.txt")
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write(report_text)
+    print(f"[*] Telemetría guardada en: {report_path}")
