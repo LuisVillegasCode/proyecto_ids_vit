@@ -109,27 +109,20 @@ class IDS2018Dataset(Dataset):
                 
             hf = self.worker_file_cache[path]
             grp = hf[flow_id]
-            raw_pkts = grp['raw_packets'][:]
-            entropies = grp['blue_channel_entropy'][:]
-            directions = grp['direction'][:] # 1: Forward, 0: Backward
             
-            current_len = min(len(raw_pkts), self.n_min)
+            # 1. Extracción directa del tensor consolidado (18, 128, 3)
+            tensor_np = grp['rgb_e_tensor'][:]
             
-            # TENSOR 3D RGB-E (Metodología 3.2)
-            # Canal 0: Rojo (Forward), Canal 1: Verde (Backward), Canal 2: Azul (Entropía)
-            img = np.zeros((3, self.n_min, self.max_bytes), dtype=np.float32)
+            # 2. Truncamiento temporal adaptativo para el estudio de ablación (eje de paquetes)
+            tensor_np = tensor_np[:self.n_min, :self.max_bytes, :]
+            if tensor_np.ndim != 3 or tensor_np.shape[-1] != 3:
+                raise ValueError(
+                    f"Tensor inválido en {fname}/{flow_id}: {tensor_np.shape}"
+                )
+            # 3. Transposición vectorizada de HWC (N_min, Max_Bytes, 3) a CHW (3, N_min, Max_Bytes) exigido por PyTorch
+            img = np.transpose(tensor_np, (2, 0, 1))
             
-            for i in range(current_len):
-                pkt_bytes = raw_pkts[i][:self.max_bytes]
-                if directions[i] == 1:
-                    img[0, i, :len(pkt_bytes)] = pkt_bytes  # Red Channel (Forward)
-                else:
-                    img[1, i, :len(pkt_bytes)] = pkt_bytes  # Green Channel (Backward)
-                
-                # Inyección de Entropía en Canal Azul
-                img[2, i, :] = entropies[i]
-                
-            # Estandarización Min-Max Global al vuelo
+            # 4. Estandarización Min-Max Global al vuelo optimizada por canales
             if self.max_r > self.min_r:
                 img[0] = (img[0] - self.min_r) / (self.max_r - self.min_r)
                 img[1] = (img[1] - self.min_r) / (self.max_r - self.min_r)
