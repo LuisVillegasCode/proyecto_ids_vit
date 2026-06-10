@@ -16,20 +16,34 @@ import torch
 import torch.nn.functional as F
 
 # ==============================================================================
-# CONFIGURACIÓN Y TELEMETRÍA
+# 0. INYECCIÓN DE ENTORNO Y CONFIGURACIÓN GLOBAL
 # ==============================================================================
+def inject_pilot_prefix(path_str: str) -> str:
+    if not path_str or path_str in ('/', '\\'): return path_str
+    clean_path = path_str.rstrip('/\\')
+    head, tail = os.path.split(clean_path)
+    if tail.startswith('pilot_'): return path_str
+    new_path = os.path.join(head, f"pilot_{tail}")
+    if path_str.endswith(('/', '\\')): new_path += path_str[-1]
+    return new_path
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--mode', type=str, choices=['pilot', 'prod'], required=True)
+args, _ = parser.parse_known_args()
+
 with open("configs/global_config.yaml", 'r') as f:
     GLOBAL_CONFIG = yaml.safe_load(f)
 
-os.makedirs(GLOBAL_CONFIG['paths']['artifacts']['telemetry_logs'], exist_ok=True)
+TELEMETRY_LOGS = GLOBAL_CONFIG['paths']['artifacts']['telemetry_logs']
+if args.mode == 'pilot':
+    TELEMETRY_LOGS = inject_pilot_prefix(TELEMETRY_LOGS)
+
+os.makedirs(TELEMETRY_LOGS, exist_ok=True)
 logging.basicConfig(
-    filename=os.path.join(GLOBAL_CONFIG['paths']['artifacts']['telemetry_logs'], "phase3_ablation.log"),
+    filename=os.path.join(TELEMETRY_LOGS, f"phase3_ablation_{args.mode}.log"),
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
-console = logging.StreamHandler()
-console.setLevel(logging.INFO)
-logging.getLogger('').addHandler(console)
 
 def safe_collate(batch):
     batch = [item for item in batch if item is not None]
@@ -267,6 +281,12 @@ def train_ablation_study(mode):
     scaler_json = GLOBAL_CONFIG['paths']['configs']['scaler_bounds']
     train_dir = GLOBAL_CONFIG['paths']['output']['train_val']
     ckpt_dir = GLOBAL_CONFIG['paths']['artifacts']['checkpoints']
+    
+    if mode == 'pilot':
+        scaler_json = inject_pilot_prefix(scaler_json)
+        train_dir = inject_pilot_prefix(train_dir)
+        ckpt_dir = inject_pilot_prefix(ckpt_dir)
+        
     os.makedirs(ckpt_dir, exist_ok=True)
     
     for n_min in n_min_candidates:
@@ -372,7 +392,4 @@ def train_ablation_study(mode):
                 logging.info(f"  -> Checkpoint histórico guardado: {hist_path}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--mode', type=str, choices=['pilot', 'prod'], required=True)
-    args = parser.parse_args()
     train_ablation_study(args.mode)
