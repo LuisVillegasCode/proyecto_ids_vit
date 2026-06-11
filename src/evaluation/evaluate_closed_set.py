@@ -39,21 +39,24 @@ def evaluate_model(n_min, mode):
     
     cpu_count = os.cpu_count() or 2
     optimal_workers = 0 if mode == 'pilot' or cpu_count <= 2 else max(1, cpu_count - 1)
-    optimal_prefetch = 2 if optimal_workers > 0 else None
     
-    dataloader = DataLoader(
-        dataset, 
-        batch_size=64, 
-        shuffle=False, # El orden no importa en evaluación
-        num_workers=optimal_workers, 
-        prefetch_factor=optimal_prefetch,
-        collate_fn=safe_collate
-    )
+    loader_kwargs = {
+        "dataset": dataset,
+        "batch_size": 64,
+        "shuffle": False, # El orden no importa en evaluación
+        "num_workers": optimal_workers,
+        "collate_fn": safe_collate
+    }
+    
+    if optimal_workers > 0:
+        loader_kwargs["prefetch_factor"] = 2
+        
+    dataloader = DataLoader(**loader_kwargs)
     
     model = ViT_OSR(n_min=n_min).to(device)
     checkpoint = torch.load(ckpt_path, map_location=device)
     model.load_state_dict(checkpoint['model_state'])
-    model.eval() # Fundamental: Apaga Dropout y congela BatchNorm/LayerNorm
+    model.eval() # Desactiva Dropout y coloca las capas en modo inferencia
     
     logging.info(f"[*] Checkpoint cargado exitosamente (Época {checkpoint['epoch']+1}). Iniciando inferencia...")
 
@@ -73,6 +76,9 @@ def evaluate_model(n_min, mode):
             all_labels.extend(labels.cpu().numpy())
 
     # 4. CÁLCULO DE MÉTRICAS METODOLÓGICAS COMPLETAS
+    if len(all_labels) == 0:
+        logging.error("[!] No se encontraron muestras válidas para evaluación en el dataset. Abortando inferencia.")
+        return
     class_names = list(dataset.class_to_idx.keys())
     class_indices = list(dataset.class_to_idx.values()) # Protección contra clases faltantes
     
