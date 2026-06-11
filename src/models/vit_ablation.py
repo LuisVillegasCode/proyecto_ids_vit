@@ -44,6 +44,9 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
+console = logging.StreamHandler()
+console.setLevel(logging.INFO)
+logging.getLogger('').addHandler(console)
 
 def safe_collate(batch):
     batch = [item for item in batch if item is not None]
@@ -365,11 +368,8 @@ def train_ablation_study(mode):
                 all_labels.extend(labels.cpu().numpy())
                 
                 pbar.set_postfix(loss=loss.item())
-                
-                if step >= 10000:
-                    break
             
-            actual_steps = min(len(dataloader), 10001)    
+            actual_steps = len(dataloader)  
             epoch_loss = running_loss / actual_steps if actual_steps > 0 else 0.0
             mcc = matthews_corrcoef(all_labels, all_preds) if len(all_labels) > 0 else 0.0
             logging.info(f"[N_min={n_min}] Época {epoch+1} | Loss: {epoch_loss:.4f} | MCC Train: {mcc:.4f}")
