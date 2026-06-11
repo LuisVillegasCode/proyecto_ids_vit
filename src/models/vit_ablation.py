@@ -36,7 +36,7 @@ def safe_collate(batch):
 # 1. EL PUENTE I/O: DATALOADER OPTIMIZADO (FR4.1 + NFR2)
 # ==============================================================================
 class IDS2018Dataset(Dataset):
-    def __init__(self, data_dir, scaler_json, n_min, max_bytes=128, mode='prod'):
+    def __init__(self, data_dir, scaler_json, n_min, max_bytes=128, mode='prod', is_osr_test=False):
         self.data_dir = data_dir
         self.n_min = n_min
         self.max_bytes = max_bytes
@@ -54,7 +54,16 @@ class IDS2018Dataset(Dataset):
             self.max_r = bounds['raw_bytes_channel']['max']
             
         self.class_to_idx = {"Benign": 0, "BruteForce": 1, "DoS": 2, "DDoS": 3, "Brute_Force_Web": 4, "Brute_Force_XSS": 5, "SQL_Injection": 6}
+        
+        # SRE: Si estamos en Fase 4 (OSR), abrimos el diccionario a las anomalías
+        if is_osr_test:
+            self.class_to_idx["Botnet"] = 7
+            self.class_to_idx["Infiltration"] = 8
+        
         self.index, self.class_counts = self._build_or_load_index()
+        
+        # INCORPORACIÓN SRE: CACHÉ DE ETIQUETAS EN RAM
+        self.labels = np.array([item[2] for item in self.index])
         
     def _build_or_load_index(self):
         index_file = os.path.join(self.data_dir, f"dataset_index_{self.mode}.pt")
