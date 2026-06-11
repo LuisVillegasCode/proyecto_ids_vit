@@ -15,38 +15,16 @@ from tqdm import tqdm
 import torch
 import torch.nn.functional as F
 
+from src.utils.config_manager import setup_environment
 # ==============================================================================
 # 0. INYECCIÓN DE ENTORNO Y CONFIGURACIÓN GLOBAL
 # ==============================================================================
-def inject_pilot_prefix(path_str: str) -> str:
-    if not path_str or path_str in ('/', '\\'): return path_str
-    clean_path = path_str.rstrip('/\\')
-    head, tail = os.path.split(clean_path)
-    if tail.startswith('pilot_'): return path_str
-    new_path = os.path.join(head, f"pilot_{tail}")
-    if path_str.endswith(('/', '\\')): new_path += path_str[-1]
-    return new_path
-
 parser = argparse.ArgumentParser()
 parser.add_argument('--mode', type=str, choices=['pilot', 'prod'], required=True)
 args, _ = parser.parse_known_args()
 
-with open("configs/global_config.yaml", 'r') as f:
-    GLOBAL_CONFIG = yaml.safe_load(f)
-
-TELEMETRY_LOGS = GLOBAL_CONFIG['paths']['artifacts']['telemetry_logs']
-if args.mode == 'pilot':
-    TELEMETRY_LOGS = inject_pilot_prefix(TELEMETRY_LOGS)
-
-os.makedirs(TELEMETRY_LOGS, exist_ok=True)
-logging.basicConfig(
-    filename=os.path.join(TELEMETRY_LOGS, f"phase3_ablation_{args.mode}.log"),
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-console = logging.StreamHandler()
-console.setLevel(logging.INFO)
-logging.getLogger('').addHandler(console)
+# Esto inicializa el YAML, setea el modo y configura el logging automáticamente
+env = setup_environment(script_name="phase3_ablation", args=args)
 
 def safe_collate(batch):
     batch = [item for item in batch if item is not None]
@@ -273,24 +251,20 @@ def train_ablation_study(mode):
     # Estudio de ablación según Metodología 4.2
     n_min_candidates = [9]
     
-    train_conf = GLOBAL_CONFIG['training']
-    vit_conf = GLOBAL_CONFIG['vit_model']
+    # Extraemos valores puros
+    train_conf = env.get_value('training')
+    vit_conf = env.get_value('vit_model')
+    config_workers = env.get_value('preprocessing', 'multiprocessing_workers')
     
     epochs_per_ablation = 5 if mode == 'pilot' else train_conf['epochs']
     batch_size = 32 if mode == 'pilot' else train_conf['batch_size']
     learning_rate = train_conf['learning_rate']
     ckpt_freq = train_conf.get('checkpoint_frequency', 5)
     
-    scaler_json = GLOBAL_CONFIG['paths']['configs']['scaler_bounds']
-    train_dir = GLOBAL_CONFIG['paths']['output']['train_val']
-    ckpt_dir = GLOBAL_CONFIG['paths']['artifacts']['checkpoints']
-    
-    if mode == 'pilot':
-        scaler_json = inject_pilot_prefix(scaler_json)
-        train_dir = inject_pilot_prefix(train_dir)
-        ckpt_dir = inject_pilot_prefix(ckpt_dir)
-        
-    os.makedirs(ckpt_dir, exist_ok=True)
+    # Extraemos rutas con inyección automática y blindaje
+    scaler_json = env.get_path('paths', 'configs', 'scaler_bounds', is_file=True)
+    train_dir = env.get_path('paths', 'output', 'train_val', ensure_exists=True)
+    ckpt_dir = env.get_path('paths', 'artifacts', 'checkpoints', ensure_exists=True)
     
     for n_min in n_min_candidates:
         logging.info(f"\n{'='*60}\n[*] INICIANDO ABLACIÓN PARA N_min = {n_min}\n{'='*60}")
@@ -302,13 +276,19 @@ def train_ablation_study(mode):
         class_weights = torch.tensor([total_samples / (len(dataset.class_counts) * (count + 1e-6)) 
                                       for count in dataset.class_counts.values()], dtype=torch.float32).to(device)
         
-        config_workers = GLOBAL_CONFIG['preprocessing']['multiprocessing_workers']
         optimal_workers = 0 if mode == 'pilot' else config_workers
-        optimal_prefetch = 2 if optimal_workers > 0 else None
+        loader_kwargs = {
+            "dataset": dataset,
+            "batch_size": batch_size,
+            "shuffle": True,
+            "num_workers": optimal_workers,
+            "pin_memory": True,
+            "collate_fn": safe_collate
+        }
+        if optimal_workers > 0:
+            loader_kwargs["prefetch_factor"] = 2
         
-        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, 
-                                num_workers=optimal_workers, pin_memory=True, 
-                                prefetch_factor=optimal_prefetch, collate_fn=safe_collate)
+        dataloader = DataLoader(**loader_kwargs)
         
         model = ViT_OSR(
             n_min=n_min,
@@ -392,4 +372,4 @@ def train_ablation_study(mode):
                 logging.info(f"  -> Checkpoint histórico guardado: {hist_path}")
 
 if __name__ == "__main__":
-    train_ablation_study(args.mode)
+    train_ablation_study(env.mode)

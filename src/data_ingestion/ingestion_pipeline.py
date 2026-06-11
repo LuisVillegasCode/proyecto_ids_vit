@@ -12,36 +12,27 @@ from collections import defaultdict
 import numpy as np
 import h5py
 
-def inject_pilot_prefix(path_str: str) -> str:
-    if not path_str or path_str in ('/', '\\'): return path_str
-    clean_path = path_str.rstrip('/\\')
-    head, tail = os.path.split(clean_path)
-    if tail.startswith('pilot_'): return path_str
-    new_path = os.path.join(head, f"pilot_{tail}")
-    if path_str.endswith(('/', '\\')): new_path += path_str[-1]
-    return new_path
-
+from src.utils.config_manager import setup_environment
 # ==============================================================================
 # 0. CONFIGURACIÓN GLOBAL Y ARGUMENTOS
 # ==============================================================================
 parser = argparse.ArgumentParser(description="Motor de Ingesta OSR-ViT")
 parser.add_argument('--mode', type=str, choices=['pilot', 'prod'], required=True)
-args, _ = parser.parse_known_args() 
+args, _ = parser.parse_known_args()
 
-try:
-    with open("configs/global_config.yaml", 'r') as f:
-        GLOBAL_CONFIG = yaml.safe_load(f)
-        
-    YAML_PATH = GLOBAL_CONFIG['paths']['configs']['dataset_schedule']
-    OUTPUT_DIR_TRAIN = GLOBAL_CONFIG['paths']['output']['train_val']
-    OUTPUT_DIR_TEST = GLOBAL_CONFIG['paths']['output']['hold_out_test']
-    MAX_PACKETS = GLOBAL_CONFIG['preprocessing'].get('max_packets_per_flow', 18)
-    MAX_BYTES = 128 
-    TELEMETRY_LOGS = GLOBAL_CONFIG['paths']['artifacts'].get('telemetry_logs', 'artifacts/logs')
-    
-except Exception as e:
-    print(f"[!] FATAL ERROR: Estructura de global_config.yaml inválida.\nDetalle: {e}")
-    sys.exit(1)
+# Instanciamos el entorno (Inversión de Control)
+env = setup_environment(script_name="ingestion_pipeline", args=args)
+
+# Extraemos rutas garantizando que existan (si es archivo, le pasamos is_file=True)
+YAML_PATH = env.get_path('paths', 'configs', 'dataset_schedule', ensure_exists=True, is_file=True)
+OUTPUT_DIR_TRAIN = env.get_path('paths', 'output', 'train_val', ensure_exists=True)
+OUTPUT_DIR_TEST = env.get_path('paths', 'output', 'hold_out_test', ensure_exists=True)
+DEAD_LETTERS_DIR = env.get_path('paths', 'data', 'dead_letters', ensure_exists=True)
+TELEMETRY_LOGS = env.get_path('paths', 'artifacts', 'telemetry_logs', ensure_exists=True)
+
+# Extraemos valores puros de forma segura
+MAX_PACKETS = env.get_value('preprocessing', 'max_packets_per_flow')
+MAX_BYTES = 128
 
 # PILAR 1: Parámetros de Máquina de Estados TCP/UDP
 FLOW_TIMEOUT_SECONDS = 120.0
@@ -58,16 +49,6 @@ RETENTION_RATES = {
     'DoS': 0.10,     
     'DDoS': 0.10    
 }
-
-if getattr(args, 'mode', None) == 'pilot':
-    OUTPUT_DIR_TRAIN = inject_pilot_prefix(OUTPUT_DIR_TRAIN)
-    OUTPUT_DIR_TEST  = inject_pilot_prefix(OUTPUT_DIR_TEST)
-    TELEMETRY_LOGS   = inject_pilot_prefix(TELEMETRY_LOGS)
-    
-os.makedirs(OUTPUT_DIR_TRAIN, exist_ok=True)
-os.makedirs(OUTPUT_DIR_TEST, exist_ok=True)
-os.makedirs(GLOBAL_CONFIG['paths']['data']['dead_letters'], exist_ok=True)
-os.makedirs(TELEMETRY_LOGS, exist_ok=True)
 
 # ==============================================================================
 # PILAR 3: ORÁCULO DINÁMICO
@@ -324,14 +305,17 @@ def process_pcap_chunk(pcap_file, rules_dict):
 # ==============================================================================
 if __name__ == "__main__":
 
-    input_dir = GLOBAL_CONFIG['paths']['data']['pilot'] if args.mode == 'pilot' else GLOBAL_CONFIG['paths']['data']['raw_chunks']
-        
+    if env.mode == 'pilot':
+        input_dir = env.get_path('paths', 'data', 'pilot', ensure_exists=True)
+    else:
+        input_dir = env.get_path('paths', 'data', 'raw_chunks', ensure_exists=True)   
+             
     if not os.path.exists(input_dir) or not os.path.isdir(input_dir):
         print(f"[!] FATAL ERROR: Directorio de entrada '{input_dir}' no existe.")
         sys.exit(1)
 
     print("=======================================================")
-    print(f" MOTOR OSR-VIT: RGB-E TENSOR FACTORY (MODO: {args.mode.upper()})")
+    print(f" MOTOR OSR-VIT: RGB-E TENSOR FACTORY (MODO: {env.mode.upper()})")
     print("=======================================================")
     
     rules_dict = load_time_aware_oracle(YAML_PATH)
@@ -358,7 +342,7 @@ if __name__ == "__main__":
         print(f"[*] ALERTA: Todos los archivos PCAP detectados ya fueron procesados previamente. Finalizando ejecución pasivamente.")
         sys.exit(0)
         
-    max_workers = min(GLOBAL_CONFIG['preprocessing']['multiprocessing_workers'], mp.cpu_count(), len(pending_pcaps))
+    max_workers = min(env.get_value('preprocessing', 'multiprocessing_workers'), mp.cpu_count(), len(pending_pcaps))
     print(f"[*] Desplegando Pool con {max_workers} Workers Concurrentes para procesar {len(pending_pcaps)} archivos pendientes...")
     
     with mp.Pool(processes=max_workers) as pool:
@@ -402,7 +386,7 @@ if __name__ == "__main__":
     report_text = "\n".join(report_lines)
     print(report_text)
     
-    report_path = os.path.join(TELEMETRY_LOGS, f"tensor_distribution_{args.mode}.txt")
+    report_path = os.path.join(TELEMETRY_LOGS, f"tensor_distribution_{env.mode}.txt")
     with open(report_path, "w", encoding="utf-8") as f:
         f.write(report_text)
     print(f"[*] Telemetría guardada en: {report_path}")

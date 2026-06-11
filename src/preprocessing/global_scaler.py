@@ -5,43 +5,24 @@ import h5py
 import json
 import argparse
 import numpy as np
-import yaml
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
 
+from src.utils.config_manager import setup_environment
 # ==============================================================================
 # 0. INYECCIÓN DE ENTORNO (PILOTO / PRODUCCIÓN)
 # ==============================================================================
-def inject_pilot_prefix(path_str: str) -> str:
-    """Aísla los directorios y archivos si estamos en modo piloto."""
-    if not path_str or path_str in ('/', '\\'): return path_str
-    clean_path = path_str.rstrip('/\\')
-    head, tail = os.path.split(clean_path)
-    if tail.startswith('pilot_'): return path_str
-    new_path = os.path.join(head, f"pilot_{tail}")
-    if path_str.endswith(('/', '\\')): new_path += path_str[-1]
-    return new_path
-
 parser = argparse.ArgumentParser(description="Perfilador Global OSR-ViT (MinMax Scaler)")
 parser.add_argument('--mode', type=str, choices=['pilot', 'prod'], required=True, 
                     help="Define si se leen los datos del entorno piloto o de producción")
 args, _ = parser.parse_known_args()
 
-try:
-    with open("configs/global_config.yaml", 'r') as f:
-        GLOBAL_CONFIG = yaml.safe_load(f)
-        
-    TRAIN_DIR = GLOBAL_CONFIG['paths']['output']['train_val']
-    OUTPUT_JSON = GLOBAL_CONFIG['paths']['configs']['scaler_bounds']
-except Exception as e:
-    print(f"[!] FATAL ERROR: Estructura de global_config.yaml inválida o archivo faltante.\nDetalle: {e}")
-    sys.exit(1)
+# Instanciamos el entorno delegando el control (Inversión de Control)
+env = setup_environment(script_name="global_scaler", args=args)
 
-# Aplicar aislamiento de entorno
-if args.mode == 'pilot':
-    TRAIN_DIR = inject_pilot_prefix(TRAIN_DIR)
-    OUTPUT_JSON = inject_pilot_prefix(OUTPUT_JSON)
-
+# Extraemos las rutas blindadas
+TRAIN_DIR = env.get_path('paths', 'output', 'train_val', ensure_exists=True)
+OUTPUT_JSON = env.get_path('paths', 'configs', 'scaler_bounds', ensure_exists=True, is_file=True)
 CHECKPOINT_FILE = OUTPUT_JSON.replace(".json", "_checkpoint.json")
 
 # ==============================================================================
@@ -103,7 +84,7 @@ def calculate_global_bounds():
         sys.exit(1)
 
     print("=======================================================")
-    print(f" INICIANDO PERFILAMIENTO GLOBAL (MODO: {args.mode.upper()})")
+    print(f" INICIANDO PERFILAMIENTO GLOBAL (MODO: {env.mode.upper()})")
     print("=======================================================")
     
     state = {
@@ -142,7 +123,7 @@ def calculate_global_bounds():
         return
 
     # Usamos todos los núcleos disponibles, reservando 1 para el SO
-    max_cores = max(1, os.cpu_count() - 1)
+    max_cores = env.get_value('preprocessing', 'multiprocessing_workers')
     print(f"[*] Escaneando {len(files_to_process)} archivos con {max_cores} motores paralelos...")
 
     processed_count = 0
