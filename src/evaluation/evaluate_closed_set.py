@@ -1,5 +1,4 @@
 import os
-import yaml
 import torch
 import logging
 import argparse
@@ -10,32 +9,40 @@ from torch.utils.data import DataLoader
 from sklearn.metrics import classification_report, confusion_matrix, matthews_corrcoef
 
 # Reutilizamos las clases que ya blindaste en el archivo anterior
-from vit_ablation import IDS2018Dataset, ViT_OSR, safe_collate
+from src.models.vit_ablation import IDS2018Dataset, ViT_OSR, safe_collate
+
+from src.utils.config_manager import setup_environment
 
 # ==============================================================================
-# CONFIGURACIÓN Y TELEMETRÍA
+# 0. INYECCIÓN DE ENTORNO Y ARGUMENTOS
 # ==============================================================================
-with open("configs/global_config.yaml", 'r') as f:
-    GLOBAL_CONFIG = yaml.safe_load(f)
+parser = argparse.ArgumentParser(description="Evaluador Closed-Set OSR-ViT")
+parser.add_argument('--mode', type=str, choices=['pilot', 'prod'], required=True)
+parser.add_argument('--n_min', type=int, required=True, help="El tamaño de ventana N_min a evaluar")
+args, _ = parser.parse_known_args()
 
-os.makedirs(GLOBAL_CONFIG['paths']['artifacts']['results'], exist_ok=True)
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Instanciamos el entorno (Inversión de Control). Esto configura el logging automáticamente.
+env = setup_environment(script_name="closed_set_evaluation", args=args)
+
+# Extraemos las rutas al nivel global, garantizando que existan (Fail-Fast)
+TEST_DIR = env.get_path('paths', 'output', 'hold_out_test', ensure_exists=True)
+SCALER_JSON = env.get_path('paths', 'configs', 'scaler_bounds', is_file=True)
+CKPT_DIR = env.get_path('paths', 'artifacts', 'checkpoints', ensure_exists=True)
+RESULTS_DIR = env.get_path('paths', 'artifacts', 'results', ensure_exists=True)
 
 def evaluate_model(n_min, mode):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logging.info(f"[*] Evaluador iniciado en: {device}")
     
     # 1. ENRUTAMIENTO AL CONJUNTO DE PRUEBA (Hold-Out)
-    test_dir = GLOBAL_CONFIG['paths']['output']['hold_out_test']
-    scaler_json = GLOBAL_CONFIG['paths']['configs']['scaler_bounds']
-    ckpt_path = os.path.join(GLOBAL_CONFIG['paths']['artifacts']['checkpoints'], f"vit_nmin_{n_min}_checkpoint.pt")
+    ckpt_path = os.path.join(CKPT_DIR, f"vit_nmin_{n_min}_checkpoint.pt")
     
     if not os.path.exists(ckpt_path):
         logging.error(f"[!] No se encontró el checkpoint para N_min={n_min}. Entrena el modelo primero.")
         return
 
     # 2. PREPARACIÓN DE DATOS Y MODELO (Con Auto-Tuning de Hardware)
-    dataset = IDS2018Dataset(test_dir, scaler_json, n_min, mode=mode)
+    dataset = IDS2018Dataset(TEST_DIR, SCALER_JSON, n_min, mode=mode)
     
     cpu_count = os.cpu_count() or 2
     optimal_workers = 0 if mode == 'pilot' or cpu_count <= 2 else max(1, cpu_count - 1)
@@ -79,6 +86,7 @@ def evaluate_model(n_min, mode):
     if len(all_labels) == 0:
         logging.error("[!] No se encontraron muestras válidas para evaluación en el dataset. Abortando inferencia.")
         return
+        
     class_names = list(dataset.class_to_idx.keys())
     class_indices = list(dataset.class_to_idx.values()) # Protección contra clases faltantes
     
@@ -123,7 +131,7 @@ def evaluate_model(n_min, mode):
     plt.xlabel('Predicción del Modelo')
     plt.title(f'Matriz de Confusión ViT (N_min={n_min})\nMCC: {mcc:.4f}')
     
-    cm_path = os.path.join(GLOBAL_CONFIG['paths']['artifacts']['results'], f"confusion_matrix_nmin_{n_min}.png")
+    cm_path = os.path.join(RESULTS_DIR, f"confusion_matrix_nmin_{n_min}.png")
     plt.tight_layout()
     plt.savefig(cm_path, dpi=300)
     plt.close() # Liberar memoria RAM de Matplotlib
@@ -131,9 +139,4 @@ def evaluate_model(n_min, mode):
     logging.info("============================================================")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--mode', type=str, choices=['pilot', 'prod'], required=True)
-    parser.add_argument('--n_min', type=int, required=True, help="El tamaño de ventana N_min a evaluar")
-    args = parser.parse_args()
-    
-    evaluate_model(args.n_min, args.mode)
+    evaluate_model(args.n_min, env.mode)
