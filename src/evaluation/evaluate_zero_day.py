@@ -37,10 +37,13 @@ def extract_latents(dataloader, model, device):
             if len(inputs) == 0: continue
             inputs, labels = inputs.to(device), labels.to(device)
             
-            logits, cls_output, _ = model(inputs)
-            preds = torch.argmax(logits, dim=1)
+            # NFR5: Eficiencia de VRAM y aceleración encendida para inferencia
+            with torch.cuda.amp.autocast():
+                logits, cls_output, _ = model(inputs)
             
-            all_latents.append(cls_output)
+            preds = torch.argmax(logits, dim=1)    
+            
+            all_latents.append(cls_output.clone())
             all_labels.append(labels)
             all_preds.append(preds)
             
