@@ -1,3 +1,4 @@
+# src/osr_module/mahalanobis.py
 import torch
 import logging
 
@@ -55,54 +56,113 @@ class OpenSetShield:
         centered = latents - self.pca_mean
         return centered @ self.pca_v
 
-    def fit_profiles(self, train_latents, train_labels, class_indices):
+    def fit_profiles(self, train_latents, train_labels, class_indices, batch_size=50000):
         """
-        Ajuste del Escudo OSR. Casting defensivo aplicado.
+        Ajuste del Escudo OSR mediante Streaming PCA (Escalabilidad O(1) en VRAM).
         """
-        train_latents = train_latents.to(dtype=torch.float64, device=self.device)
-        self.fit_pca(train_latents)
-        proj_latents = self.transform_pca(train_latents)
+        num_samples = train_latents.size(0)
+        latent_dim = train_latents.size(1)
+        
+        # 1. STREAMING MEAN (Calculamos la media global por bloques)
+        sum_latents = torch.zeros(latent_dim, dtype=torch.float64, device=self.device)
+        for i in range(0, num_samples, batch_size):
+            batch = train_latents[i:i+batch_size].to(self.device, dtype=torch.float64)
+            sum_latents += batch.sum(dim=0)
+        self.pca_mean = (sum_latents / num_samples).unsqueeze(0)
+        
+        # 2. STREAMING COVARIANCE para PCA (Calculamos X^T * X por bloques)
+        cov_sum = torch.zeros((latent_dim, latent_dim), dtype=torch.float64, device=self.device)
+        for i in range(0, num_samples, batch_size):
+            batch = train_latents[i:i+batch_size].to(self.device, dtype=torch.float64)
+            centered_batch = batch - self.pca_mean
+            cov_sum += centered_batch.T @ centered_batch
+            
+        cov = cov_sum / (num_samples - 1)
+        eigenvalues, eigenvectors = torch.linalg.eigh(cov)
+        self.pca_v = torch.flip(eigenvectors, dims=[1])[:, :self.n_components]
+
+        # Estructuras acumulativas para calcular perfiles de clase en Streaming
+        class_counts = {c: 0 for c in class_indices}
+        class_sums = {c: torch.zeros(self.n_components, dtype=torch.float64, device=self.device) for c in class_indices}
+        class_cov_sums = {c: torch.zeros((self.n_components, self.n_components), dtype=torch.float64, device=self.device) for c in class_indices}
+
+        # 3. STREAMING CENTROIDS (Media por clase)
+        for i in range(0, num_samples, batch_size):
+            batch = train_latents[i:i+batch_size].to(self.device, dtype=torch.float64)
+            batch_labels = train_labels[i:i+batch_size].to(self.device)
+            proj_batch = (batch - self.pca_mean) @ self.pca_v
+            
+            for c in class_indices:
+                mask = (batch_labels == c)
+                if not mask.any(): continue
+                x_c = proj_batch[mask]
+                class_sums[c] += x_c.sum(dim=0)
+                class_counts[c] += x_c.size(0)
 
         for c in class_indices:
-            mask = (train_labels == c)
-            class_latents = proj_latents[mask]
-            
-            if len(class_latents) < 2:
-                continue
-                
-            mu = class_latents.mean(dim=0)
-            centered = class_latents - mu
-            cov = (centered.T @ centered) / (centered.size(0) - 1)
-            
-            inv_cov = self._robust_inverse(cov)
-            self.centroids[c] = mu
-            self.inv_covariances[c] = inv_cov
+            if class_counts[c] < 2: continue
+            self.centroids[c] = class_sums[c] / class_counts[c]
 
-    def calculate_distances(self, latents, labels):
+        # 4. STREAMING MAHALANOBIS COVARIANCE (Covarianza por clase)
+        for i in range(0, num_samples, batch_size):
+            batch = train_latents[i:i+batch_size].to(self.device, dtype=torch.float64)
+            batch_labels = train_labels[i:i+batch_size].to(self.device)
+            proj_batch = (batch - self.pca_mean) @ self.pca_v
+            
+            for c in class_indices:
+                mask = (batch_labels == c)
+                if not mask.any(): continue
+                x_c = proj_batch[mask]
+                centered_c = x_c - self.centroids[c]
+                class_cov_sums[c] += centered_c.T @ centered_c
+
+        # 5. Inversión final
+        for c in class_indices:
+            if class_counts[c] < 2: continue
+            cov_c = class_cov_sums[c] / (class_counts[c] - 1)
+            self.inv_covariances[c] = self._robust_inverse(cov_c)
+
+    def calculate_distances(self, latents, labels, batch_size=50000):
         """
         Cálculo Vectorizado de Distancia de Mahalanobis.
         Fórmula: M_k(x) = (f(x) - mu_k)^T Sigma_k^-1 (f(x) - mu_k)
         """
-        proj_latents = self.transform_pca(latents.to(dtype=torch.float64, device=self.device))
-        distances = torch.zeros(latents.size(0), dtype=torch.float64, device=self.device)
+        num_samples = latents.size(0)
+        # Almacenamos el resultado en CPU RAM para no saturar la GPU
+        distances = torch.zeros(num_samples, dtype=torch.float64, device='cpu')
         
-        for c in self.centroids.keys():
-            mask = (labels == c)
-            if not mask.any(): continue
+        for i in range(0, num_samples, batch_size):
+            # Subimos solo el lote actual a la GPU
+            batch_latents = latents[i:i+batch_size].to(dtype=torch.float64, device=self.device)
+            batch_labels = labels[i:i+batch_size].to(device=self.device)
             
-            x_c = proj_latents[mask]
-            mu = self.centroids[c]
-            inv_cov = self.inv_covariances[c]
+            proj_batch = self.transform_pca(batch_latents)
+            batch_dists = torch.zeros(batch_latents.size(0), dtype=torch.float64, device=self.device)
             
-            diff = x_c - mu
-            # Multiplicación matricial eficiente en GPU: (x-mu) @ Sigma^-1
-            left_term = torch.matmul(diff, inv_cov)
-            # Producto punto fila por fila para aislar cada tensor
-            dist_sq = torch.sum(left_term * diff, dim=1)
+            for c in self.centroids.keys():
+                mask = (batch_labels == c)
+                if not mask.any(): continue
+                
+                x_c = proj_batch[mask]
+                mu = self.centroids[c]
+                inv_cov = self.inv_covariances[c]
+                
+                diff = x_c - mu
+                left_term = torch.matmul(diff, inv_cov)
+                dist_sq = torch.sum(left_term * diff, dim=1)
+                
+                batch_dists[mask] = torch.clamp(dist_sq, min=0.0)
+                
+            # Descargamos el resultado del lote a la RAM
+            distances[i:i+batch_size] = batch_dists.cpu()
             
-            # Protección contra underflow negativo
-            distances[mask] = torch.clamp(dist_sq, min=0.0)
-            
+            # Solo eliminamos las referencias, NO vaciamos la caché aquí
+            del batch_latents, batch_labels, proj_batch, batch_dists
+        
+        # La limpieza de VRAM se hace UNA VEZ, fuera del bucle    
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+                
         return distances
 
     def calibrate_thresholds(self, val_latents, val_labels):
@@ -128,8 +188,13 @@ class OpenSetShield:
         """
         Intercepción de inferencia. Retorna un tensor booleano y las distancias.
         """
+        # Garantizamos explícitamente que las etiquetas vivan en la RAM (CPU)
+        predicted_labels = predicted_labels.cpu()
+        
         distances = self.calculate_distances(latents, predicted_labels)
-        is_anomaly = torch.zeros(latents.size(0), dtype=torch.bool, device=self.device)
+        
+        # Sincronización de dispositivos: is_anomaly vive en la RAM
+        is_anomaly = torch.zeros(latents.size(0), dtype=torch.bool, device='cpu')
         
         for c in self.centroids.keys():
             mask = (predicted_labels == c)
