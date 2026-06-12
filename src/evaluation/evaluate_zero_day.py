@@ -10,6 +10,7 @@ import gc
 from torch.utils.data import DataLoader, Subset
 from sklearn.metrics import roc_auc_score, matthews_corrcoef
 from sklearn.model_selection import StratifiedShuffleSplit
+from sklearn.preprocessing import QuantileTransformer
 from tqdm import tqdm
 
 from src.models.vit_ablation import IDS2018Dataset, ViT_OSR, safe_collate
@@ -84,6 +85,40 @@ def extract_latents(dataloader, model, device, split_name="train", cache_dir=Non
 
     return torch.from_numpy(latents_mm), torch.from_numpy(labels_mm), torch.from_numpy(preds_mm)
 
+def gaussianize_latents_in_place(latents, scaler, fit=False, subsample_size=100000, batch_size=50000):
+    """
+    SRE: Aplica Transformación de Cuantiles en bloques modificando el disco directamente.
+    Evita OOM en RAM ajustando el scaler solo con un submuestreo aleatorio.
+    """
+    num_samples = latents.size(0)
+    
+    if fit:
+        logging.info(f"[*] Ajustando QuantileTransformer con submuestreo de {min(subsample_size, num_samples)} muestras...")
+        if num_samples > subsample_size:
+            # Semilla determinista para reproducibilidad estricta
+            np.random.seed(42)
+            # Seleccionamos índices aleatorios rápidos
+            indices = np.random.choice(num_samples, size=subsample_size, replace=False)
+            sample_data = latents[indices].numpy()
+        else:
+            sample_data = latents.numpy()
+            
+        scaler.fit(sample_data)
+        del sample_data # Liberamos los ~300 MB del submuestreo
+        
+    logging.info(f"[*] Transformando {num_samples} latentes a espacio Gaussiano en streaming...")
+    for i in tqdm(range(0, num_samples, batch_size), desc="Gaussianizando Lotes", leave=False):
+        batch_np = latents[i:i+batch_size].numpy()
+        
+        # Conversión explícita a float32 para coincidir con el memmap
+        transformed = scaler.transform(batch_np).astype(np.float32)
+        
+        # Transforma y sobrescribe DIRECTAMENTE en la vista del memmap (Disco)
+        latents[i:i+batch_size].copy_(torch.from_numpy(transformed))
+        
+        # Higiene estricta de RAM: destruimos la variable temporal
+        del transformed
+
 def evaluate_osr(n_min, mode):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logging.info(f"[*] Inyectando Escudo OSR en: {device}")
@@ -131,6 +166,12 @@ def evaluate_osr(n_min, mode):
         logging.info("[*] Escaneando subespacio latente de Entrenamiento...")
         train_latents, train_labels, _ = extract_latents(train_loader, model, device, split_name="train", cache_dir=cache_dir)
         
+        # --- GAUSSIANIZACIÓN ---
+        # Cuantiles dinámicos para evitar warnings en el modo piloto
+        safe_quantiles = min(10000, train_latents.size(0))
+        scaler = QuantileTransformer(n_quantiles=safe_quantiles, output_distribution='normal', random_state=42, copy=False)
+        gaussianize_latents_in_place(train_latents, scaler, fit=True)
+        
         shield = OpenSetShield(n_components=128, lambda_mad=3.0, device=device)
         shield.fit_profiles(train_latents, train_labels, list(train_dataset.class_to_idx.values()))
         
@@ -141,6 +182,10 @@ def evaluate_osr(n_min, mode):
         # 3. CALIBRACIÓN DE UMBRALES (Fase OSR CALIBRATE)
         logging.info("[*] Calibrando fronteras dinámicas (MAD) usando Validación...")
         val_latents, val_labels, _ = extract_latents(val_loader, model, device, split_name="val", cache_dir=cache_dir)
+        
+        # --- GAUSSIANIZACIÓN ---
+        gaussianize_latents_in_place(val_latents, scaler, fit=False)
+        
         shield.calibrate_thresholds(val_latents, val_labels)
         
         del val_latents, val_labels
@@ -150,6 +195,9 @@ def evaluate_osr(n_min, mode):
         # 4. INFERENCIA EN ENTORNO ABIERTO (Fase OSR TEST)
         logging.info("[*] Detonando inferencia OSR en Conjunto de Prueba (Zero-Days Mixtos)...")
         test_latents, test_labels, test_preds = extract_latents(test_loader, model, device, split_name="test", cache_dir=cache_dir)
+        
+        # --- GAUSSIANIZACIÓN ---
+        gaussianize_latents_in_place(test_latents, scaler, fit=False)
         
         is_anomaly, mahalanobis_distances = shield.detect_anomalies(test_latents, test_preds)
         
