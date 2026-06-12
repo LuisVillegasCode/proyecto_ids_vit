@@ -825,6 +825,15 @@ def train_short_variant(
     device: torch.device,
 ) -> Dict[str, float]:
     set_seed(args.seed)
+    
+    if variant not in {"focal", "focal_fisher"}:
+        raise ValueError(
+            f"Variante desconocida: {variant!r}. "
+            "Debe ser 'focal' o 'focal_fisher'."
+        )
+
+    if args.short_epochs < 1:
+        raise ValueError("short_epochs debe ser mayor o igual que 1.")
 
     model = build_model(
         args.n_min,
@@ -846,14 +855,17 @@ def train_short_variant(
         feat_dim=vit_conf["embed_dim"],
         device=device,
     )
-
+    
     learning_rate = env.get_value("training")["learning_rate"]
+    
+    if learning_rate <= 0:
+        raise ValueError("learning_rate debe ser mayor que 0.")
+    
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=learning_rate,
         weight_decay=0.01,
     )
-    scaler = make_grad_scaler(device)
 
     for epoch in range(args.short_epochs):
         model.train()
@@ -873,38 +885,74 @@ def train_short_variant(
             inputs = inputs.to(device)
             labels = labels.to(device)
             optimizer.zero_grad(set_to_none=True)
-
-            with torch.autocast(
-                device_type=device.type,
-                enabled=(device.type == "cuda"),
-            ):
-                logits, features, _ = model(inputs)
-                focal_loss = focal(logits, labels)
+            
+            logits, features, _ = model(
+                inputs,
+                return_attention=False,
+            )
+            
+            focal_loss = focal(
+                logits.float(),
+                labels,
+            )
 
             if variant == "focal_fisher":
-                with torch.autocast(
-                    device_type=device.type,
-                    enabled=False,
-                ):
-                    fisher_loss = fisher(
-                        features.float(),
-                        labels,
-                        logits.float(),
-                    )
+                fisher_loss = fisher(
+                    features.float(),
+                    labels,
+                    logits.float(),
+                )
             else:
                 fisher_loss = features.new_tensor(0.0)
+            
+            if not torch.isfinite(inputs).all():
+                raise FloatingPointError(
+                    f"{variant}: los inputs contienen NaN/Inf."
+                )
+
+            if not torch.isfinite(logits).all():
+                raise FloatingPointError(
+                    f"{variant}: los logits contienen NaN/Inf "
+                    f"en la época {epoch + 1}."
+                )
+
+            if not torch.isfinite(features).all():
+                raise FloatingPointError(
+                    f"{variant}: los embeddings contienen NaN/Inf "
+                    f"en la época {epoch + 1}."
+                )
+
+            if not torch.isfinite(focal_loss):
+                raise FloatingPointError(
+                    f"{variant}: Focal Loss produjo NaN/Inf "
+                    f"en la época {epoch + 1}."
+                )
+
+            if not torch.isfinite(fisher_loss):
+                raise FloatingPointError(
+                    f"{variant}: Fisher Loss produjo NaN/Inf "
+                    f"en la época {epoch + 1}."
+                )
 
             total_loss = focal_loss.float() + lambda_value * fisher_loss
             if not torch.isfinite(total_loss):
                 raise FloatingPointError(
-                    f"{variant}: NaN/Inf en short run, época {epoch + 1}."
+                    f"{variant}: NaN/Inf en short run, "
+                    f"época {epoch + 1}. "
+                    f"Focal={focal_loss.item()}, "
+                    f"Fisher={fisher_loss.item()}"
                 )
-
-            scaler.scale(total_loss).backward()
-            scaler.unscale_(optimizer)
-            validate_gradients(model)
-            scaler.step(optimizer)
-            scaler.update()
+            total_loss.backward()
+            
+            grad_norm = validate_gradients(model)
+            
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                max_norm=5.0,
+                error_if_nonfinite=True,
+            )
+            
+            optimizer.step()
             running += total_loss.item()
 
         if processed == 0:
