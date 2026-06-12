@@ -456,6 +456,18 @@ def train_single_batch_variant(
 ) -> Dict[str, float]:
     set_seed(args.seed)
 
+    if variant not in {"focal", "focal_fisher"}:
+        raise ValueError(
+            f"Variante no reconocida: {variant!r}. "
+            "Debe ser 'focal' o 'focal_fisher'."
+        )
+
+    if steps < 1:
+        raise ValueError("steps debe ser mayor o igual que 1.")
+
+    if learning_rate <= 0:
+        raise ValueError("learning_rate debe ser mayor que 0.")
+    
     model = build_model(
         n_min,
         vit_conf,
@@ -482,52 +494,95 @@ def train_single_batch_variant(
         lr=learning_rate,
         weight_decay=0.0,
     )
-    scaler = make_grad_scaler(device)
-    amp_enabled = device.type == "cuda"
+    
+    model.eval()
 
+    with torch.no_grad():
+        initial_logits, _, _ = model(
+            inputs,
+            return_attention=False,
+        )
+        initial_focal = float(
+            focal(initial_logits.float(), labels).item()
+        )
+    
+        if not torch.isfinite(initial_logits).all():
+            raise FloatingPointError(
+            f"{variant}: los logits iniciales contienen NaN/Inf."
+        )
+
+        if not math.isfinite(initial_focal):
+            raise FloatingPointError(
+                f"{variant}: la Focal Loss inicial contiene NaN/Inf."
+            )
+            
     model.train()
-    initial_focal = None
     last_metrics: Dict[str, float] = {}
 
     for step in range(steps):
         optimizer.zero_grad(set_to_none=True)
-
-        with torch.autocast(
-            device_type=device.type,
-            enabled=amp_enabled,
-        ):
-            logits, features, _ = model(inputs)
-            focal_loss = focal(logits, labels)
+        logits, features, _ = model(inputs, return_attention=False,)
+        focal_loss = focal(logits.float(), labels)
 
         if variant == "focal_fisher":
-            with torch.autocast(
-                device_type=device.type,
-                enabled=False,
-            ):
-                fisher_loss = fisher(
-                    features.float(),
-                    labels,
-                    logits.float(),
-                )
+            fisher_loss = fisher(
+            features.float(),
+            labels,
+            logits.float(),
+            )
             lambda_value = 5e-2 * math.exp(
                 -5.0 * (step / max(steps - 1, 1))
             )
         else:
             fisher_loss = features.new_tensor(0.0)
-            lambda_value = 0.0
+            lambda_value = 0.0    
 
         total_loss = focal_loss.float() + lambda_value * fisher_loss
 
-        if not torch.isfinite(total_loss):
+        # Validaciones antes del backward
+        if not torch.isfinite(inputs).all():
             raise FloatingPointError(
-                f"{variant}: loss NaN/Inf en el paso {step + 1}."
+                f"{variant}: los inputs contienen NaN/Inf."
             )
 
-        scaler.scale(total_loss).backward()
-        scaler.unscale_(optimizer)
+        if not torch.isfinite(logits).all():
+            raise FloatingPointError(
+                f"{variant}: los logits contienen NaN/Inf en el paso {step + 1}."
+            )
+
+        if not torch.isfinite(features).all():
+            raise FloatingPointError(
+                f"{variant}: los embeddings contienen NaN/Inf en el paso {step + 1}."
+            )
+            
+        if not torch.isfinite(focal_loss):
+            raise FloatingPointError(
+            f"{variant}: Focal Loss produjo NaN/Inf en el paso {step + 1}."
+        )
+
+        if not torch.isfinite(fisher_loss):
+            raise FloatingPointError(
+                f"{variant}: Fisher Loss produjo NaN/Inf en el paso {step + 1}."
+            )
+
+        if not torch.isfinite(total_loss):
+            raise FloatingPointError(
+                f"{variant}: loss NaN/Inf en el paso {step + 1}. "
+                f"Focal={focal_loss.item()}, Fisher={fisher_loss.item()}"
+            )
+
+        total_loss.backward()
+
         grad_norm = validate_gradients(model)
-        scaler.step(optimizer)
-        scaler.update()
+
+        # Protección adicional ante explosión de gradientes
+        torch.nn.utils.clip_grad_norm_(
+            model.parameters(),
+            max_norm=5.0,
+            error_if_nonfinite=True,
+        )
+
+        optimizer.step()
 
         predictions = torch.argmax(logits, dim=1)
         mcc = matthews_corrcoef(
@@ -536,14 +591,11 @@ def train_single_batch_variant(
         )
 
         geometry = compute_geometry(
-            features.float(),
+            features.detach().float(),
             labels,
-            logits.float(),
+            logits.detach().float(),
             only_correct=True,
         )
-
-        if initial_focal is None:
-            initial_focal = float(focal_loss.detach().item())
 
         last_metrics = {
             "focal": float(focal_loss.detach().item()),
@@ -570,9 +622,52 @@ def train_single_batch_variant(
                 last_metrics["inter"],
                 last_metrics["ratio"],
             )
+    
+    model.eval()
 
-    if initial_focal is None:
-        raise RuntimeError(f"{variant}: no se ejecutó ningún paso.")
+    with torch.no_grad():
+        final_logits, final_features, _ = model(
+            inputs,
+            return_attention=False,
+        )
+        final_focal = focal(final_logits.float(), labels)
+        
+        if not torch.isfinite(final_logits).all():
+            raise FloatingPointError(
+            f"{variant}: los logits finales contienen NaN/Inf."
+        )
+
+        if not torch.isfinite(final_features).all():
+            raise FloatingPointError(
+                f"{variant}: los embeddings finales contienen NaN/Inf."
+            )
+
+        if not torch.isfinite(final_focal):
+            raise FloatingPointError(
+                f"{variant}: la Focal Loss final produjo NaN/Inf."
+            )
+        
+        final_predictions = torch.argmax(final_logits, dim=1)
+
+        final_mcc = matthews_corrcoef(
+            labels.detach().cpu().numpy(),
+            final_predictions.detach().cpu().numpy(),
+        )
+
+        final_geometry = compute_geometry(
+            final_features.float(),
+            labels,
+            final_logits.float(),
+            only_correct=True,
+        )
+        
+    last_metrics["last_train_fisher"] = last_metrics["fisher"]
+    last_metrics["last_train_total"] = last_metrics["total"]
+    last_metrics["last_train_grad_norm"] = last_metrics["grad_norm"]
+
+    last_metrics["focal"] = float(final_focal.item())
+    last_metrics["mcc"] = float(final_mcc)
+    last_metrics.update(final_geometry)
 
     if last_metrics["focal"] >= initial_focal:
         raise RuntimeError(f"{variant}: Focal Loss no disminuyó.")
