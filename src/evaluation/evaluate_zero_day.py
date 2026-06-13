@@ -158,8 +158,12 @@ def evaluate_osr(n_min, mode):
         val_loader = DataLoader(val_subset, **loader_kwargs)
         test_loader = DataLoader(test_dataset, **loader_kwargs)
         
-        model = ViT_OSR(n_min=n_min).to(device)
-        model.load_state_dict(torch.load(ckpt_path, map_location=device)['model_state'])
+        model = ViT_OSR(
+            n_min=n_min,
+            num_classes=len(train_dataset.class_to_idx),
+        ).to(device)
+        checkpoint = torch.load(ckpt_path, map_location=device)
+        model.load_state_dict(checkpoint["model_state"])
         model.eval()
 
         # 2. CONSTRUCCIÓN DE PERFILES CONOCIDOS (Fase OSR FIT)

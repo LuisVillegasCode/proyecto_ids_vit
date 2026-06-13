@@ -3,34 +3,15 @@
 # ========================================================================
 # Rutas de enrutamiento:
 #   - hold_out_test: Cuarentena estricta (100% de la amenaza).
-#   - stratified_split: Partición hash 90/10 (train_val / hold_out_test).
+#   - stratified_split: Partición hash 80/10/10 (train, validation, evaluation).
 # ========================================================================
 
 attacks:
   # ----------------------------------------------------------------------
   # AMENAZAS ZERO-DAY / OUT-OF-DISTRIBUTION (OOD)
+  # Nunca participan en entrenamiento, Min-Max, PCA, Quantile ni MAD.
   # ----------------------------------------------------------------------
   zero_day:
-    - attack_name: "Infiltration"
-      date: "2018-02-28"
-      attacker_ips: ["13.58.225.34"]
-      victim_ips: ["18.221.148.137", "172.31.69.24"]
-      time_windows:
-        - ["10:50", "12:05"]
-        - ["13:42", "14:40"]
-      target_folder: "hold_out_test"
-      label: "Infiltration"
-
-    - attack_name: "Infiltration"
-      date: "2018-03-01"
-      attacker_ips: ["13.58.225.34"]
-      victim_ips: ["18.216.254.154", "172.31.69.13"]
-      time_windows:
-        - ["09:57", "10:55"]
-        - ["14:00", "15:37"]
-      target_folder: "hold_out_test"
-      label: "Infiltration"
-
     - attack_name: "Botnet"
       date: "2018-03-02"
       attacker_ips: ["18.219.211.138"]
@@ -46,44 +27,37 @@ attacks:
         - ["14:24", "15:55"]
       target_folder: "hold_out_test"
       label: "Botnet"
+    
+    # OOD complementario: familia Web Attack
+    - attack_name: "Brute Force -Web"
+      date: "2018-02-22"
+      attacker_ips: ["18.218.115.60"]
+      victim_ips: ["18.218.83.150", "172.31.69.28"]
+      time_windows: [["10:17", "11:24"]]
+      target_folder: "stratified_split"
+      label: "Web_Attack"
+
+    - attack_name: "Brute Force -XSS"
+      date: "2018-02-22"
+      attacker_ips: ["18.218.115.60"]
+      victim_ips: ["18.218.83.150", "172.31.69.28"]
+      time_windows: [["13:50", "14:29"]]
+      target_folder: "stratified_split"
+      label: "Web_Attack"
+
+    - attack_name: "SQL Injection"
+      date: "2018-02-22"
+      attacker_ips: ["18.218.115.60"]
+      victim_ips: ["18.218.83.150", "172.31.69.28"]
+      time_windows: [["16:15", "16:29"]]
+      target_folder: "stratified_split"
+      label: "Web_Attack"
 
   # ----------------------------------------------------------------------
   # ATAQUES CONOCIDOS / IN-DISTRIBUTION (CLOSED-SET)
   # ----------------------------------------------------------------------
   closed_set:
     # --- SEMANA 1 ---
-    - attack_name: "FTP-BruteForce"
-      date: "2018-02-14"
-      attacker_ips: ["172.31.70.4", "18.221.219.4"]
-      victim_ips: ["172.31.69.25", "18.217.21.148"]
-      time_windows: [["10:32", "12:09"]]
-      target_folder: "stratified_split"
-      label: "BruteForce"
-
-    - attack_name: "SSH-Bruteforce"
-      date: "2018-02-14"
-      attacker_ips: ["172.31.70.6", "13.58.98.64"]
-      victim_ips: ["18.217.21.148", "172.31.69.25"]
-      time_windows: [["14:01", "15:31"]]
-      target_folder: "stratified_split"
-      label: "BruteForce"
-
-    - attack_name: "DoS-GoldenEye"
-      date: "2018-02-15"
-      attacker_ips: ["172.31.70.46", "18.219.211.138"]
-      victim_ips: ["18.217.21.148", "172.31.69.25"]
-      time_windows: [["09:26", "10:09"]]
-      target_folder: "stratified_split"
-      label: "DoS"
-
-    - attack_name: "DoS-Slowloris"
-      date: "2018-02-15"
-      attacker_ips: ["172.31.70.8", "18.217.165.70"]
-      victim_ips: ["18.217.21.148", "172.31.69.25"]
-      time_windows: [["10:59", "11:40"]]
-      target_folder: "stratified_split"
-      label: "DoS"
-
     - attack_name: "DoS-SlowHTTPTest"
       date: "2018-02-16"
       attacker_ips: ["172.31.70.23", "13.59.126.31"]
@@ -101,20 +75,6 @@ attacks:
       label: "DoS"
 
     # --- SEMANA 2 ---
-    - attack_name: "DDoS-LOIC-HTTP-UDP"
-      date: "2018-02-20"
-      attacker_ips: [
-        "18.218.115.60", "18.219.9.1", "18.219.32.43", "18.218.55.126", 
-        "52.14.136.135", "18.219.5.43", "18.216.200.189", "18.218.229.235", 
-        "18.218.11.51", "18.216.24.42"
-      ]
-      victim_ips: ["18.217.21.148", "172.31.69.25"]
-      time_windows: 
-        - ["10:12", "11:17"] #TCP
-        - ["13:13", "13:32"] #UDP
-      target_folder: "stratified_split"
-      label: "DDoS"
-
     - attack_name: "DDoS-LOIC-HOIC"
       date: "2018-02-21"
       attacker_ips: [
@@ -128,53 +88,3 @@ attacks:
         - ["14:05", "15:05"]
       target_folder: "stratified_split"
       label: "DDoS"
-
-    # --- JUEVES 22 ---
-    - attack_name: "Brute Force -Web"
-      date: "2018-02-22"
-      attacker_ips: ["18.218.115.60"]
-      victim_ips: ["18.218.83.150", "172.31.69.28"]
-      time_windows: [["10:17", "11:24"]]
-      target_folder: "stratified_split"
-      label: "Brute_Force_Web"
-
-    - attack_name: "Brute Force -XSS"
-      date: "2018-02-22"
-      attacker_ips: ["18.218.115.60"]
-      victim_ips: ["18.218.83.150", "172.31.69.28"]
-      time_windows: [["13:50", "14:29"]]
-      target_folder: "stratified_split"
-      label: "Brute_Force_XSS"
-
-    - attack_name: "SQL Injection"
-      date: "2018-02-22"
-      attacker_ips: ["18.218.115.60"]
-      victim_ips: ["18.218.83.150", "172.31.69.28"]
-      time_windows: [["16:15", "16:29"]]
-      target_folder: "stratified_split"
-      label: "SQL_Injection"
-
-    # --- VIERNES 23 ---
-    - attack_name: "Brute Force -Web"
-      date: "2018-02-23"
-      attacker_ips: ["18.218.115.60"]
-      victim_ips: ["18.218.83.150", "172.31.69.28"]
-      time_windows: [["10:03", "11:03"]]
-      target_folder: "stratified_split"
-      label: "Brute_Force_Web"
-
-    - attack_name: "Brute Force -XSS"
-      date: "2018-02-23"
-      attacker_ips: ["18.218.115.60"]
-      victim_ips: ["18.218.83.150", "172.31.69.28"]
-      time_windows: [["13:00", "14:10"]]
-      target_folder: "stratified_split"
-      label: "Brute_Force_XSS"
-
-    - attack_name: "SQL Injection"
-      date: "2018-02-23"
-      attacker_ips: ["18.218.115.60"]
-      victim_ips: ["18.218.83.150", "172.31.69.28"]
-      time_windows: [["15:05", "15:18"]]
-      target_folder: "stratified_split"
-      label: "SQL_Injection"

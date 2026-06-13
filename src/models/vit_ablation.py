@@ -73,19 +73,17 @@ class IDS2018Dataset(Dataset):
             self.min_r = bounds["raw_bytes_channel"]["min"]
             self.max_r = bounds["raw_bytes_channel"]["max"]
 
+        # Taxonomía definitiva del experimento.
         self.class_to_idx = {
             "Benign": 0,
-            "BruteForce": 1,
-            "DoS": 2,
-            "DDoS": 3,
-            "Brute_Force_Web": 4,
-            "Brute_Force_XSS": 5,
-            "SQL_Injection": 6,
+            "DoS": 1,
+            "DDoS": 2,
         }
 
+        # Las clases OOD solo se incorporan al mapa durante la evaluación abierta.
         if is_osr_test:
-            self.class_to_idx["Botnet"] = 7
-            self.class_to_idx["Infiltration"] = 8
+            self.class_to_idx["Botnet"] = 3
+            self.class_to_idx["Web_Attack"] = 4
 
         self.index, self.class_counts = self._build_or_load_index()
         
@@ -242,7 +240,7 @@ class ViT_OSR(nn.Module):
         embed_dim=768,
         depth=12,
         num_heads=12,
-        num_classes=7,
+        num_classes=3,
     ):
         super().__init__()
         self.patch_h, self.patch_w = patch_size

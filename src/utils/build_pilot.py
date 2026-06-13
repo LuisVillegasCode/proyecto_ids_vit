@@ -15,7 +15,6 @@ TARGET_CLASSES = [
     "Benign",
     "DoS",
     "DDoS",
-    "Brute_Force_Web",
 ]
 
 SAMPLES_PER_CLASS = 64

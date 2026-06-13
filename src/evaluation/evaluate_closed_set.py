@@ -60,7 +60,10 @@ def evaluate_model(n_min, mode):
         
     dataloader = DataLoader(**loader_kwargs)
     
-    model = ViT_OSR(n_min=n_min).to(device)
+    model = ViT_OSR(
+        n_min=n_min,
+        num_classes=len(dataset.class_to_idx),
+    ).to(device)
     checkpoint = torch.load(ckpt_path, map_location=device)
     model.load_state_dict(checkpoint['model_state'])
     model.eval() # Desactiva Dropout y coloca las capas en modo inferencia
