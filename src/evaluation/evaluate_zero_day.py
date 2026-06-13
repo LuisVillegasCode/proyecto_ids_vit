@@ -224,7 +224,7 @@ def evaluate_osr(n_min, mode):
         meta_y_true = np.isin(test_labels_np, known_classes_idx, invert=True).astype(int)
         
         if np.sum(meta_y_true) == 0:
-            logging.error("[!] CUIDADO: No se encontraron clases Zero-Day (Botnet/Infiltration) en el dataloader de prueba.")
+            logging.error("[!] CUIDADO: No se encontraron clases Zero-Day (Botnet/Web_Attack) en el dataloader de prueba.")
             return
 
         # Métrica OSR 1: AUROC

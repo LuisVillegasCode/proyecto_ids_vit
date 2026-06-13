@@ -248,10 +248,14 @@ def process_pcap_chunk(pcap_file, rules_dict):
                     state = flow_states[canonical_tuple]
                     state['last_time'] = timestamp
 
-                    # PILAR 3 / Solución Problema 1: Promoción Dinámica de Etiquetas segura
+                    # Promoción dinámica de etiqueta y corrección obligatoria del destino.
+                    # Si cualquier paquete de la sesión coincide con una regla OOD,
+                    # toda la sesión debe quedar aislada en hold_out_test.
                     if packet_label != 'Benign' and state['label'] != packet_label:
                         state['label'] = packet_label
-                        # target_dir se mantiene intacto para garantizar reproducibilidad 
+
+                        if target_folder == "hold_out_test":
+                            state["target_dir"] = OUTPUT_DIR_TEST
 
                     # PILAR 2: Máquina de Estados y Detección Temprana (IGNORING)
                     if state['status'] == 'CAPTURING':
