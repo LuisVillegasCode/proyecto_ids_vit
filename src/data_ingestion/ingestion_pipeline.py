@@ -24,7 +24,7 @@ args, _ = parser.parse_known_args()
 
 env = setup_environment(script_name="ingestion_pipeline", args=args)
 
-YAML_PATH = env.get_path('paths', 'configs', 'dataset_schedule', ensure_exists=True, is_file=True)
+YAML_PATH = env.get_path('paths', 'configs', 'dataset_schedule', ensure_exists=True, is_file=True, apply_pilot=False)
 OUTPUT_DIR_TRAIN = env.get_path('paths', 'output', 'train_known', ensure_exists=True)
 OUTPUT_DIR_VAL = env.get_path('paths', 'output', 'val_known', ensure_exists=True)
 OUTPUT_DIR_TEST = env.get_path('paths', 'output', 'test_known', ensure_exists=True)
