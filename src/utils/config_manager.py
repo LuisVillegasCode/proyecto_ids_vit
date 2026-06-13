@@ -29,13 +29,20 @@ class Environment:
             raise RuntimeError(f"[*] FATAL ERROR: Fallo al cargar el archivo de configuración {config_path}.\nDetalle: {e}")
 
     def inject_pilot_prefix(self, path_str: str) -> str:
-        """Aísla los directorios y archivos si estamos en modo piloto."""
-        if not path_str or path_str in ('/', '\\'): return path_str
+        """Aísla las rutas de salida en modo piloto sin duplicar el prefijo."""
+        if not path_str or path_str in ('/', '\\'):
+            return path_str
+
         clean_path = path_str.rstrip('/\\')
         head, tail = os.path.split(clean_path)
-        if tail.startswith('pilot_'): return path_str
+
+        if tail == 'pilot' or tail.startswith('pilot_'):
+            return path_str
+
         new_path = os.path.join(head, f"pilot_{tail}")
-        if path_str.endswith(('/', '\\')): new_path += path_str[-1]
+        if path_str.endswith(('/', '\\')):
+            new_path += path_str[-1]
+
         return new_path
 
     def get_value(self, *keys):
@@ -49,20 +56,20 @@ class Environment:
             data = data[key]
         return data
 
-    def get_path(self, *keys, ensure_exists=False, is_file=False) -> str:
-        """
-        Obtiene una ruta y aplica el aislamiento si corresponde.
-        Mejora 2: Uso del flag explícito 'is_file' en lugar de heurística de extensiones.
-        """
+    def get_path(self, *keys, ensure_exists=False, is_file=False, apply_pilot=True) -> str:
+        """Obtiene una ruta y permite desactivar explícitamente el aislamiento piloto."""
         raw_path = str(self.get_value(*keys))
-        final_path = self.inject_pilot_prefix(raw_path) if self.mode == 'pilot' else raw_path
-        
+
+        if self.mode == 'pilot' and apply_pilot:
+            final_path = self.inject_pilot_prefix(raw_path)
+        else:
+            final_path = raw_path
+
         if ensure_exists:
-            # Si el desarrollador indica que es un archivo, creamos solo el directorio contenedor
             dir_to_create = os.path.dirname(final_path) if is_file else final_path
             if dir_to_create:
                 os.makedirs(dir_to_create, exist_ok=True)
-                
+
         return final_path
 
     def _setup_logging(self):
