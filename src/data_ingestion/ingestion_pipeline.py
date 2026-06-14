@@ -268,6 +268,13 @@ def build_and_route_tensor(flow_id, state, finalized_flows, local_metrics):
         tensor[i, :DELTA_TIME_COLUMNS, channel] = pkt['delta_time_encoded']
         tensor[i, DELTA_TIME_COLUMNS:DELTA_TIME_COLUMNS + length, channel] = raw[:length]
         tensor[i, :, 2] = pkt['entropy']
+        
+    if flow_id in finalized_flows[split_dir]:
+        raise RuntimeError(
+        f"Colisión de session_id detectada antes del flush: "
+        f"{flow_id} | {state['source_capture']} | "
+        f"{state['canonical_tuple']} | instancia={state['session_instance']}"
+    )    
 
     finalized_flows[split_dir][flow_id] = {
         'tensor': tensor,
@@ -275,6 +282,7 @@ def build_and_route_tensor(flow_id, state, finalized_flows, local_metrics):
         'attack_subtype': state['attack_subtype'],
         'split': split_name,
         'session_id': flow_id,
+        'session_instance': state['session_instance'],
         'canonical_tuple': state['canonical_tuple'],
         'split_group_key': state['split_group_key'],
         'capture_day': state['capture_day'],
@@ -304,7 +312,7 @@ def flush_tensors_hdf5(prefix, target_dir, data_dict, worker_id, filename, batch
         for flow_id, payload in data_dict.items():
             safe_id = str(flow_id).replace('/', '_').replace('\\', '_')
             grp = hf.create_group(safe_id)
-            for attr_name in ['label', 'attack_subtype', 'split', 'session_id', 'canonical_tuple', 'split_group_key', 'capture_day', 'source_capture']:
+            for attr_name in ['label', 'attack_subtype', 'split', 'session_id', 'session_instance', 'canonical_tuple', 'split_group_key', 'capture_day', 'source_capture']:
                 grp.attrs[attr_name] = payload[attr_name]
             grp.attrs['source_files'] = json.dumps(payload['source_files'], ensure_ascii=False)
             grp.attrs['start_timestamp'] = payload['start_timestamp']
@@ -343,6 +351,7 @@ def process_pcap_chunk(pcap_file, rules_dict):
     _cleanup_partial_outputs(capture_id)
 
     flow_states = {}
+    session_instance_counters = defaultdict(int)
     finalized_flows = {directory: {} for directory in OUTPUT_DIRECTORIES.values()}
     local_metrics = {
         'generated_tensors': defaultdict(int),
@@ -428,12 +437,16 @@ def process_pcap_chunk(pcap_file, rules_dict):
                                 finalize_state(canonical_tuple)
 
                             if canonical_tuple not in flow_states:
+                                session_instance_counters[canonical_tuple] += 1
+                                session_instance = session_instance_counters[canonical_tuple]
                                 first_timestamp_us = int(round(timestamp * 1_000_000))
-                                session_material = f"{source_capture}|{canonical_tuple}|{first_timestamp_us}"
+                                session_material = f"{source_capture}|{canonical_tuple}|{first_timestamp_us}|{session_instance}"
                                 session_id = hashlib.sha256(session_material.encode('utf-8')).hexdigest()[:24]
                                 split_group_key = hashlib.sha256(f"{capture_day}|{canonical_tuple}".encode('utf-8')).hexdigest()
+                                
                                 flow_states[canonical_tuple] = {
                                     'session_id': session_id,
+                                    'session_instance': session_instance,
                                     'canonical_tuple': canonical_tuple,
                                     'split_group_key': split_group_key,
                                     'capture_day': capture_day,
