@@ -732,7 +732,7 @@ def train_ablation_study(mode):
     amp_enabled, amp_dtype, use_grad_scaler = _resolve_amp(device, train_conf)
     logging.info("[*] Acelerador: %s | AMP: %s | dtype: %s", device, amp_enabled, amp_dtype)
 
-    n_min_candidates = [9]
+    n_min_candidates = [7]
     epochs_per_ablation = 5 if mode == "pilot" else int(train_conf["epochs"])
     batch_size = 32 if mode == "pilot" else int(train_conf["batch_size"])
     learning_rate = float(train_conf["learning_rate"])
