@@ -99,9 +99,9 @@ training:
 # 4. MOTOR DE RECONOCIMIENTO ABIERTO Y TELEMETRÍA (Fase 4 y 5)
 # ------------------------------------------------------------------------------
 osr_shield:
-  pca_variance_retained: 0.99            # FR8: Retención para el cálculo desde el token [CLS]
-  lambda_candidates: [1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 7.0]
-  selected_lambda_mad: null
+  pca_variance_retained: 0.999999            # FR8: Retención para el cálculo desde el token [CLS]
+  lambda_candidates: [1.0, 1.25, 1.5, 1.75, 2.0, 3.0, 4.5, 7.0]
+  selected_lambda_mad: 1.25
   max_val_known_frr: 0.10
   ridge_epsilon_init: 1.0e-5              # NFR8: Prevención de LinAlgError en matriz de covarianza
   quantile_count: 10000

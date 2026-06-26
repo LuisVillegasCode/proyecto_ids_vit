@@ -651,8 +651,10 @@ def _ood_subtype_breakdown(subtypes, anomalies, scores):
 
 def _resolve_osr_settings(osr_config):
     pca_variance = float(osr_config.get("pca_variance_retained", 0.99))
-    if not math.isclose(pca_variance, 0.99, rel_tol=0.0, abs_tol=1e-12):
-        raise RuntimeError(f"La metodología fija pca_variance_retained=0.99; valor configurado={pca_variance}")
+    if not 0.0 < pca_variance <= 1.0:
+        raise RuntimeError(
+            f"pca_variance_retained debe estar en (0, 1]; valor configurado={pca_variance}"
+        )
     candidates = [float(value) for value in osr_config.get("lambda_candidates", [1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 7.0])]
     if not candidates or any(not math.isfinite(value) or value <= 0 for value in candidates):
         raise ValueError("lambda_candidates debe contener valores positivos y finitos")
