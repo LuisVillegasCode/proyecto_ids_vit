@@ -1,0 +1,15 @@
+torch
+numpy
+pandas
+scikit-learn
+PyYAML
+matplotlib
+seaborn
+Pillow
+einops
+h5py
+dpkt
+mlflow
+dvc
+fvcore
+tqdm
